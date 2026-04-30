@@ -1,0 +1,33 @@
+{
+  "Id": "seed_safe_place",
+  "Timestamp": "2026-04-20T14:22:10.000Z",
+  "PromptText": "A place you feel safe",
+  "PromptEmotionalTags": ["comforting", "intimate", "nostalgic"],
+  "SessionDuration": 118.4,
+  "FinalInfluence": 0.18,
+  "FinalPhase": "Helping",
+  "TotalPlacements": 14,
+  "PlayerPlacements": 12,
+  "AssistantPlacements": 2,
+  "AverageCadenceSeconds": 9.1,
+  "DominantGroups": ["domestic", "furniture", "item"],
+  "DominantTags": ["comforting", "domestic", "intimate"],
+  "GroupCounts": { "domestic": 6, "furniture": 5, "item": 3 },
+  "TagCounts": { "comforting": 8, "domestic": 6, "intimate": 5, "nostalgic": 3 },
+  "Placements": [
+    { "Position": [-1.2, 0.0, 0.8],  "Group": "furniture", "GlbPath": "dod/props_furniture/bedframe_single.glb",  "Tags": ["furniture"], "EmotionalTags": ["comforting", "domestic"], "Timestamp": 8.2,  "IsPlayer": true },
+    { "Position": [1.4, 0.0, -0.3],  "Group": "furniture", "GlbPath": "dod/props_furniture/bookcase_large.glb",  "Tags": ["furniture"], "EmotionalTags": ["comforting", "domestic"], "Timestamp": 17.8, "IsPlayer": true },
+    { "Position": [-0.3, 0.0, 1.8],  "Group": "domestic",  "GlbPath": "dod/props_furniture/bathtub1.glb",       "Tags": ["domestic"],  "EmotionalTags": ["comforting", "domestic"], "Timestamp": 26.5, "IsPlayer": true },
+    { "Position": [0.6, 0.0, 0.4],   "Group": "item",      "GlbPath": "css/props_lab/desklamp01.glb",           "Tags": ["item"],      "EmotionalTags": ["comforting"],            "Timestamp": 34.1, "IsPlayer": true },
+    { "Position": [-2.1, 0.0, -0.9], "Group": "furniture", "GlbPath": "dod/props_furniture/bookcase_small.glb", "Tags": ["furniture"], "EmotionalTags": ["comforting", "domestic"], "Timestamp": 43.4, "IsPlayer": true },
+    { "Position": [2.0, 0.0, 1.5],   "Group": "domestic",  "GlbPath": "dod/props_furniture/bakery_counter1.glb","Tags": ["domestic"],  "EmotionalTags": ["domestic"],              "Timestamp": 51.7, "IsPlayer": true },
+    { "Position": [-0.8, 0.0, -1.6], "Group": "furniture", "GlbPath": "dod/props_furniture/ceiling_lantern1_off.glb", "Tags": ["furniture"], "EmotionalTags": ["comforting", "intimate"], "Timestamp": 60.0, "IsPlayer": true },
+    { "Position": [0.2, 0.0, 2.4],   "Group": "item",      "GlbPath": "css/props_lab/citizenradio.glb",         "Tags": ["item"],      "EmotionalTags": ["nostalgic"],             "Timestamp": 68.9, "IsPlayer": true },
+    { "Position": [1.8, 0.0, -1.4],  "Group": "domestic",  "GlbPath": "dod/props_furniture/bakery_counter2.glb","Tags": ["domestic"],  "EmotionalTags": ["domestic"],              "Timestamp": 77.2, "IsPlayer": true },
+    { "Position": [-1.7, 0.0, 1.2],  "Group": "domestic",  "GlbPath": "dod/props_furniture/bakery_counter3.glb","Tags": ["domestic"],  "EmotionalTags": ["domestic"],              "Timestamp": 85.5, "IsPlayer": true },
+    { "Position": [0.9, 0.0, -2.0],  "Group": "furniture", "GlbPath": "dod/props_furniture/bookcase_large.glb", "Tags": ["furniture"], "EmotionalTags": ["comforting", "domestic"], "Timestamp": 93.8, "IsPlayer": true },
+    { "Position": [-2.8, 0.0, 0.3],  "Group": "item",      "GlbPath": "css/props_lab/desklamp01.glb",           "Tags": ["item"],      "EmotionalTags": ["comforting"],            "Timestamp": 102.1,"IsPlayer": true },
+    { "Position": [2.5, 0.0, 0.9],   "Group": "domestic",  "GlbPath": "dod/props_furniture/bathtub1.glb",       "Tags": ["domestic"],  "EmotionalTags": ["comforting", "domestic"], "Timestamp": 106.4,"IsPlayer": false },
+    { "Position": [-0.4, 0.0, -2.5], "Group": "item",      "GlbPath": "css/props_lab/citizenradio.glb",         "Tags": ["item"],      "EmotionalTags": ["nostalgic"],             "Timestamp": 111.7,"IsPlayer": false }
+  ]
+}
