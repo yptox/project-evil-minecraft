@@ -31,7 +31,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: c47dd2d68368b40c2bc3d73b7de56037, type: 3}
   m_Name: PSXRendererFeature
   m_EditorClassIdentifier: Assembly-CSharp::AlgorithmicGallery.Corruption.PSXRendererFeature
-  m_Active: 0
+  m_Active: 1
   settings:
     colorBits: 5
     ditherStrength: 0.6

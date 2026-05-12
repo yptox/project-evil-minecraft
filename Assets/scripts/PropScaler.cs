@@ -42,31 +42,47 @@ namespace AlgorithmicGallery.Corruption
         private const float MaxScaleFactor = 15.0f;
         private const float GlobalModelScaleMultiplier = 4.0f;
 
+        /// <summary>
+        /// Applied to every computed placement scale so sandbox pedestal props read ~3x smaller
+        /// than the pre-shrink art direction (see shrink plan: uniform ÷3).
+        /// </summary>
+        private const float SandboxPedestalUniformScale = 1f / 3f;
+
         // ────────────────────────────────────────────────────────────────────
 
         /// Returns the uniform scale factor that brings <paramref name="prop"/>
-        /// into its group's natural range, or 1 if it's already within range.
+        /// into its group's natural range, then applies the optional scene-level multiplier.
         public static float ComputeScaleFactor(PropEntry prop)
         {
+            return ComputeScaleFactor(prop, 1f);
+        }
+
+        /// <summary>
+        /// Returns the runtime placement scale using shared scaler logic plus
+        /// an optional scene-level multiplier (e.g. pedestal tuning).
+        /// </summary>
+        public static float ComputeScaleFactor(PropEntry prop, float sceneMultiplier)
+        {
             if (prop == null) return 1f;
+            float sceneMul = Mathf.Max(0.0001f, sceneMultiplier);
 
             // Manual override from CurationLab takes absolute priority.
             if (prop.ScaleOverride > 0.001f)
-                return Mathf.Clamp(prop.ScaleOverride * GlobalModelScaleMultiplier, MinScaleFactor, MaxScaleFactor);
+                return Mathf.Clamp(prop.ScaleOverride * GlobalModelScaleMultiplier * sceneMul * SandboxPedestalUniformScale, MinScaleFactor, MaxScaleFactor);
 
             float longest = prop.LongestAxis;
             if (longest < 0.001f)
-                return GlobalModelScaleMultiplier;   // unknown dims — still apply global art direction boost
+                return Mathf.Clamp(GlobalModelScaleMultiplier * sceneMul * SandboxPedestalUniformScale, MinScaleFactor, MaxScaleFactor);   // unknown dims — still apply global art direction boost
 
             var range = _ranges.TryGetValue(prop.Group ?? "", out var r) ? r : _defaultRange;
 
             if (longest >= range.min && longest <= range.max)
-                return GlobalModelScaleMultiplier;  // already natural, then apply global art direction boost
+                return Mathf.Clamp(GlobalModelScaleMultiplier * sceneMul * SandboxPedestalUniformScale, MinScaleFactor, MaxScaleFactor);  // already natural, then apply global art direction boost
 
             // Clamp to nearest bound: scale down if oversized, scale up if tiny
             float target = longest < range.min ? range.min : range.max;
             float factor = target / longest;
-            return Mathf.Clamp(factor * GlobalModelScaleMultiplier, MinScaleFactor, MaxScaleFactor);
+            return Mathf.Clamp(factor * GlobalModelScaleMultiplier * sceneMul * SandboxPedestalUniformScale, MinScaleFactor, MaxScaleFactor);
         }
 
         /// Applies ComputeScaleFactor to <paramref name="go"/> in local space.
@@ -83,10 +99,19 @@ namespace AlgorithmicGallery.Corruption
         /// Useful for collision box sizing or UI tooltips.
         public static float ScaledLongestAxis(PropEntry prop)
         {
+            return ScaledLongestAxis(prop, 1f);
+        }
+
+        /// <summary>
+        /// Returns the final world-space longest axis after scaling with scene multiplier.
+        /// Useful for comparing curation preview pedestal vs runtime placement.
+        /// </summary>
+        public static float ScaledLongestAxis(PropEntry prop, float sceneMultiplier)
+        {
             if (prop == null) return 0f;
             float longest = prop.LongestAxis;
             if (longest < 0.001f) return 0f;
-            return longest * ComputeScaleFactor(prop);
+            return longest * ComputeScaleFactor(prop, sceneMultiplier);
         }
     }
 }

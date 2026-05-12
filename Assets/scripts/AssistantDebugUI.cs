@@ -12,6 +12,8 @@ namespace AlgorithmicGallery.Corruption
         [SerializeField] private HotbarController _hotbar;
 
         private bool _visible;
+        private Vector2 _scroll;
+        private GUIStyle _eventLineStyle;
 
         void Start()
         {
@@ -31,14 +33,26 @@ namespace AlgorithmicGallery.Corruption
         {
             if (!_visible) return;
 
+            if (_eventLineStyle == null)
+            {
+                _eventLineStyle = new GUIStyle(GUI.skin.label)
+                {
+                    wordWrap = true,
+                    fontSize = 11,
+                    richText = false
+                };
+            }
+
             GUI.color = new Color(0f, 0f, 0f, 0.75f);
-            GUI.DrawTexture(new Rect(10, 10, 340, 400), Texture2D.whiteTexture);
+            GUI.DrawTexture(new Rect(10, 10, 380, 520), Texture2D.whiteTexture);
             GUI.color = Color.white;
 
-            GUILayout.BeginArea(new Rect(16, 16, 328, 390));
+            GUILayout.BeginArea(new Rect(16, 16, 368, 508));
 
             GUILayout.Label("=== ASSISTANT DEBUG (F1) ===");
-            GUILayout.Space(6);
+            GUILayout.Space(4);
+
+            _scroll = GUILayout.BeginScrollView(_scroll, GUILayout.ExpandHeight(true));
 
             if (_assistant != null)
             {
@@ -83,6 +97,12 @@ namespace AlgorithmicGallery.Corruption
                 }
             }
 
+            GUILayout.Space(8);
+            GUILayout.Label("── RECENT EVENTS (newest at bottom) ──");
+            for (int i = 0; i < GameplayEventDebugLog.Count; i++)
+                GUILayout.Label(GameplayEventDebugLog.GetLine(i), _eventLineStyle, GUILayout.Width(352));
+
+            GUILayout.EndScrollView();
             GUILayout.EndArea();
         }
     }

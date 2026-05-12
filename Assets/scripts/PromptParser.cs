@@ -393,6 +393,11 @@ namespace AlgorithmicGallery.Corruption
                 maxCount: 4
             );
 
+            string corporateTarget = PromptScoringHelper.PickCorporateFromUserTextAndEmotions(
+                text,
+                topTags,
+                tagScores);
+
             var prompt = new PromptDefinition
             {
                 DisplayText = userText, // The end card shows the user's literal phrase
@@ -400,6 +405,7 @@ namespace AlgorithmicGallery.Corruption
                 DriftGroups = driftGroups,
                 EmotionalTags = topTags.ToArray(),
                 DriftEmotionalTags = driftEmotionalTags,
+                CorporateTargetTag = corporateTarget,
                 IsAbstract = true, // Custom input is always treated as abstract
                 Source = "custom",
                 ParseConfidence = confidence,

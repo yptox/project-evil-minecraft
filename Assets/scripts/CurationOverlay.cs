@@ -15,6 +15,8 @@ namespace AlgorithmicGallery.Corruption
     {
         [JsonProperty("group")]          public string Group { get; set; }
         [JsonProperty("emotional_tags")] public List<string> EmotionalTags { get; set; }
+        [JsonProperty("personal_tags")]  public List<string> PersonalTags { get; set; }
+        [JsonProperty("corporate_tags")] public List<string> CorporateTags { get; set; }
         [JsonProperty("scale_override")] public float ScaleOverride { get; set; } = 0f;
         [JsonProperty("custom_tags")]    public List<string> CustomTags { get; set; }
         [JsonProperty("notes")]          public string Notes { get; set; } = "";
@@ -82,6 +84,14 @@ namespace AlgorithmicGallery.Corruption
                 if (!overlay.Overrides.TryGetValue(prop.Id, out var entry)) continue;
                 if (!string.IsNullOrEmpty(entry.Group))   prop.Group = entry.Group;
                 if (entry.EmotionalTags != null)           prop.EmotionalTags = new List<string>(entry.EmotionalTags);
+                if (entry.PersonalTags != null)            prop.PersonalTags = new List<string>(entry.PersonalTags);
+                if (entry.CorporateTags != null)           prop.CorporateTags = new List<string>(entry.CorporateTags);
+                if ((entry.PersonalTags != null && entry.PersonalTags.Count > 0) &&
+                    (entry.EmotionalTags == null || entry.EmotionalTags.Count == 0))
+                    prop.EmotionalTags = new List<string>(entry.PersonalTags);
+                if ((entry.EmotionalTags != null && entry.EmotionalTags.Count > 0) &&
+                    (entry.PersonalTags == null || entry.PersonalTags.Count == 0))
+                    prop.PersonalTags = new List<string>(entry.EmotionalTags);
                 if (entry.ScaleOverride > 0.001f)          prop.ScaleOverride = entry.ScaleOverride;
                 if (entry.CustomTags != null)              prop.CustomTags = new List<string>(entry.CustomTags);
                 if (!string.IsNullOrEmpty(entry.Notes))    prop.Notes = entry.Notes;

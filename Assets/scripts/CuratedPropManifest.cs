@@ -17,6 +17,8 @@ namespace AlgorithmicGallery.Corruption
         [JsonProperty("category")] public string Category { get; set; }
         [JsonProperty("tags")]     public List<string> Tags { get; set; } = new();
         [JsonProperty("emotional_tags")] public List<string> EmotionalTags { get; set; } = new();
+        [JsonProperty("personal_tags")]  public List<string> PersonalTags { get; set; } = new();
+        [JsonProperty("corporate_tags")] public List<string> CorporateTags { get; set; } = new();
         [JsonProperty("poly_count")]    public int PolyCount { get; set; }
         [JsonProperty("dimensions")]    public PropDimensions Dimensions { get; set; } = new();
         [JsonProperty("size_category")] public string SizeCategory { get; set; } = "unknown";
@@ -44,6 +46,9 @@ namespace AlgorithmicGallery.Corruption
 
     public class CuratedPropManifest
     {
+        /// <summary>Default gameplay manifest under StreamingAssets.</summary>
+        public const string DefaultManifestFileName = "curated-props.json";
+
         private List<PropEntry> _all = new();
         private List<PropEntry> _allHighConf = new();   // confidence ≥ 0.8 (pipeline-validated)
         private Dictionary<string, List<PropEntry>> _byGroup = new();
@@ -55,9 +60,26 @@ namespace AlgorithmicGallery.Corruption
         public IReadOnlyList<PropEntry> All => _all;
         public IEnumerable<string> Groups => _byGroup.Keys;
 
-        public static CuratedPropManifest LoadFromStreamingAssets()
+        private static string StreamingManifestPath =>
+            ManifestPath(DefaultManifestFileName);
+
+        /// <summary>StreamingAssets-relative manifest file name (e.g. curated-props.game-ready.json).</summary>
+        public static string ManifestPath(string manifestFileName)
         {
-            string path = Path.Combine(Application.streamingAssetsPath, "curated-props.json");
+            if (string.IsNullOrWhiteSpace(manifestFileName))
+                manifestFileName = DefaultManifestFileName;
+            manifestFileName = manifestFileName.Trim().TrimStart('/', '\\');
+            return Path.Combine(Application.streamingAssetsPath, manifestFileName);
+        }
+
+        /// <summary>Load the default curated manifest (curated-props.json).</summary>
+        public static CuratedPropManifest LoadFromStreamingAssets()
+            => LoadFromStreamingAssets(DefaultManifestFileName);
+
+        /// <summary>Load a curated manifest by file name under StreamingAssets.</summary>
+        public static CuratedPropManifest LoadFromStreamingAssets(string manifestFileName)
+        {
+            string path = ManifestPath(manifestFileName);
             if (!File.Exists(path))
             {
                 Debug.LogError($"CuratedPropManifest: file not found at {path}");
@@ -77,6 +99,18 @@ namespace AlgorithmicGallery.Corruption
             manifest._allHighConf = root.Props.Where(p => p.Confidence >= 0.8f).ToList();
             foreach (var p in root.Props)
             {
+                p.EmotionalTags ??= new List<string>();
+                p.PersonalTags ??= new List<string>();
+                p.CorporateTags ??= new List<string>();
+                p.CustomTags ??= new List<string>();
+                p.Tags ??= new List<string>();
+
+                // Backward compatibility for old manifests and forward compatibility for new schema.
+                if (p.PersonalTags.Count == 0 && p.EmotionalTags.Count > 0)
+                    p.PersonalTags = new List<string>(p.EmotionalTags);
+                if (p.EmotionalTags.Count == 0 && p.PersonalTags.Count > 0)
+                    p.EmotionalTags = new List<string>(p.PersonalTags);
+
                 if (!string.IsNullOrEmpty(p.Id))
                     manifest._byId[p.Id] = p;
 
@@ -102,11 +136,31 @@ namespace AlgorithmicGallery.Corruption
             // Log enrichment stats so we can see pipeline results at load time.
             int withDims  = root.Props.Count(p => p.LongestAxis > 0.001f);
             int highConf  = root.Props.Count(p => p.Confidence >= 0.8f);
-            Debug.Log($"CuratedPropManifest: loaded {root.Props.Count} props across " +
+            int withCorporate = root.Props.Count(p => p.CorporateTags != null && p.CorporateTags.Count > 0);
+            Debug.Log($"CuratedPropManifest: loaded {manifestFileName} — {root.Props.Count} props across " +
                       $"{manifest._byGroup.Count} groups, " +
                       $"{manifest._byEmotionalTag.Count} emotional tags | " +
-                      $"dims={withDims} conf≥0.8={highConf}");
+                      $"dims={withDims} conf≥0.8={highConf} corporate={withCorporate}");
             return manifest;
+        }
+
+        /// <summary>
+        /// Persists the current in-memory manifest to StreamingAssets/curated-props.json.
+        /// This is the gameplay source of truth read by runtime systems.
+        /// </summary>
+        public void SaveToStreamingAssets(ISet<string> removedIds = null)
+        {
+            var propsToWrite = _all
+                .Where(p => p != null && (removedIds == null || !removedIds.Contains(p.Id)))
+                .OrderBy(p => p.Id ?? string.Empty, StringComparer.Ordinal)
+                .ThenBy(p => p.DisplayName ?? string.Empty, StringComparer.Ordinal)
+                .ToList();
+
+            var root = new ManifestRoot { Props = propsToWrite };
+            string json = JsonConvert.SerializeObject(root, Formatting.Indented);
+            File.WriteAllText(StreamingManifestPath, json);
+
+            Debug.Log($"CuratedPropManifest: wrote {propsToWrite.Count} props to {StreamingManifestPath}");
         }
 
         public PropEntry GetById(string id)
@@ -274,6 +328,61 @@ namespace AlgorithmicGallery.Corruption
                 .ToList();
 
             if (scored.Count == 0) return GetRandomFromGroups(groups, excludeIds);
+            return WeightedPick(scored);
+        }
+
+        /// <summary>
+        /// Prefers props whose <see cref="PropEntry.CorporateTags"/> contains <paramref name="corporateSlug"/>.
+        /// Constrained to <paramref name="groups"/>; falls back to emotional-weighted pick then random in groups.
+        /// </summary>
+        public PropEntry GetWeightedByCorporateTagInGroups(
+            string corporateSlug,
+            string[] groups,
+            IEnumerable<string> secondaryEmotionalTags = null,
+            float randomness = 0.18f,
+            HashSet<string> excludeIds = null)
+        {
+            if (_all.Count == 0) return null;
+            string slug = (corporateSlug ?? "").Trim().ToLowerInvariant();
+            if (string.IsNullOrEmpty(slug))
+                return GetRandomFromGroups(groups, excludeIds);
+
+            if (UnityEngine.Random.value < randomness)
+                return GetRandomFromGroups(groups, excludeIds);
+
+            var pool = groups != null && groups.Length > 0
+                ? _all.Where(p => Array.IndexOf(groups, p.Group) >= 0)
+                : (IEnumerable<PropEntry>)_all;
+
+            if (excludeIds != null)
+                pool = pool.Where(p => !excludeIds.Contains(p.Id));
+
+            var secondary = secondaryEmotionalTags != null
+                ? new HashSet<string>(secondaryEmotionalTags, StringComparer.OrdinalIgnoreCase)
+                : null;
+
+            var scored = pool
+                .Select(p =>
+                {
+                    bool corpHit = p.CorporateTags != null && p.CorporateTags.Any(c =>
+                        string.Equals((c ?? "").Trim(), slug, StringComparison.OrdinalIgnoreCase));
+                    int corpScore = corpHit ? 4 : 0;
+                    int emScore = 0;
+                    if (secondary != null && secondary.Count > 0 && p.EmotionalTags != null)
+                        emScore = p.EmotionalTags.Count(t => secondary.Contains(t));
+                    return (prop: p, score: corpScore * 3 + emScore);
+                })
+                .Where(x => x.score > 0)
+                .OrderByDescending(x => x.score)
+                .ToList();
+
+            if (scored.Count == 0)
+            {
+                if (secondary != null && secondary.Count > 0)
+                    return GetWeightedByEmotionalTagsInGroups(secondary, groups, randomness: randomness * 1.25f, excludeIds);
+                return GetRandomFromGroups(groups, excludeIds);
+            }
+
             return WeightedPick(scored);
         }
 

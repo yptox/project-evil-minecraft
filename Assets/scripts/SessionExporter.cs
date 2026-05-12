@@ -25,7 +25,13 @@ namespace AlgorithmicGallery.Corruption
 
         public void Export()
         {
-            if (_sandbox?.StyleProfile == null) return;
+            if (_sandbox?.StyleProfile == null)
+            {
+                GameplayEventDebugLog.Push("Export", "skipped (no StyleProfile)");
+                return;
+            }
+
+            GameplayEventDebugLog.Push("Export", "session export started");
 
             var sp = _sandbox.StyleProfile;
             var assistant = _sandbox.Assistant;
@@ -38,10 +44,24 @@ namespace AlgorithmicGallery.Corruption
 
             var dominantEmotionalTags = sp.DominantEmotionalTags(3);
 
+            Vector3 sandboxOrigin = _sandbox.SandboxFloor != null
+                ? _sandbox.SandboxFloor.position
+                : Vector3.zero;
+            Quaternion sandboxRotation = _sandbox.SandboxFloor != null
+                ? _sandbox.SandboxFloor.rotation
+                : Quaternion.identity;
+            Vector3 sandboxScale = _sandbox.SandboxFloor != null
+                ? _sandbox.SandboxFloor.lossyScale
+                : Vector3.one;
+
             var payload = new SessionRecord
             {
+                SchemaVersion = SessionRecord.CurrentSchemaVersion,
                 Id = sessionId,
                 Timestamp = timestamp,
+                SandboxOrigin = new[] { sandboxOrigin.x, sandboxOrigin.y, sandboxOrigin.z },
+                SandboxRotation = new[] { sandboxRotation.x, sandboxRotation.y, sandboxRotation.z, sandboxRotation.w },
+                SandboxScale = new[] { sandboxScale.x, sandboxScale.y, sandboxScale.z },
                 PromptText = prompt?.DisplayText ?? "",
                 PromptEmotionalTags = prompt?.EmotionalTags ?? new string[0],
                 PromptIntentObjects = prompt?.IntentObjects ?? new string[0],
@@ -65,6 +85,8 @@ namespace AlgorithmicGallery.Corruption
                 Placements = sp.History.Select(r => new PlacementSnapshot
                 {
                     Position = new[] { r.Position.x, r.Position.y, r.Position.z },
+                    Rotation = new[] { r.Rotation.x, r.Rotation.y, r.Rotation.z, r.Rotation.w },
+                    Scale = new[] { r.LocalScale.x, r.LocalScale.y, r.LocalScale.z },
                     Group = r.Group,
                     GlbPath = r.GlbPath,
                     Tags = r.Tags,
@@ -81,6 +103,7 @@ namespace AlgorithmicGallery.Corruption
             string fullPath = Path.Combine(sessionsDir, filename);
             File.WriteAllText(fullPath, json);
             Debug.Log($"[SessionExporter] Wrote {fullPath}");
+            GameplayEventDebugLog.Push("Export", $"wrote {filename} ({payload.TotalPlacements} placements, schema v{payload.SchemaVersion}, origin={sandboxOrigin})");
 
             // Append to sessions/index.json so the hallway can find recent sessions
             AppendToIndex(sessionsDir, new IndexEntry
@@ -148,8 +171,15 @@ namespace AlgorithmicGallery.Corruption
         [Serializable]
         private class SessionRecord
         {
+            public const int CurrentSchemaVersion = 3;
+
+            /// <summary>2+ includes SandboxOrigin and per-placement Rotation/Scale for exact replay; 3+ adds sandbox rotation/scale.</summary>
+            public int SchemaVersion;
             public string Id;
             public string Timestamp;
+            public float[] SandboxOrigin;
+            public float[] SandboxRotation;
+            public float[] SandboxScale;
             public string PromptText;
             public string[] PromptEmotionalTags;
             public string[] PromptIntentObjects;
@@ -177,6 +207,8 @@ namespace AlgorithmicGallery.Corruption
         private class PlacementSnapshot
         {
             public float[] Position;
+            public float[] Rotation;
+            public float[] Scale;
             public string Group;
             public string GlbPath;
             public List<string> Tags;

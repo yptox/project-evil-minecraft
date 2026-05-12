@@ -10,6 +10,10 @@ namespace AlgorithmicGallery.Corruption
     // dominant tags the assistant learned, and a final fade-to-black.
     public class EndCard : MonoBehaviour
     {
+        [Header("Disable")]
+        [Tooltip("When true, this component does nothing — session end uses hallway / reload flow instead.")]
+        [SerializeField] private bool _disableEndCardCompletely = true;
+
         [SerializeField] private SandboxManager _sandbox;
         [SerializeField] private Color _backgroundColor = new Color(0f, 0f, 0f, 0.92f);
         [SerializeField] private float _fadeInDuration = 2f;
@@ -30,6 +34,12 @@ namespace AlgorithmicGallery.Corruption
 
         void Awake()
         {
+            if (_disableEndCardCompletely)
+            {
+                enabled = false;
+                return;
+            }
+
             _audioSource = gameObject.AddComponent<AudioSource>();
             _audioSource.playOnAwake = false;
             _audioSource.spatialBlend = 0f;
@@ -38,6 +48,9 @@ namespace AlgorithmicGallery.Corruption
 
         void Start()
         {
+            if (_disableEndCardCompletely)
+                return;
+
             if (_sandbox == null) _sandbox = FindFirstObjectByType<SandboxManager>();
             if (_sandbox != null)
                 _sandbox.OnSessionComplete.AddListener(Show);

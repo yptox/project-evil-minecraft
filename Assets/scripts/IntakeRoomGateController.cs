@@ -22,6 +22,9 @@ namespace AlgorithmicGallery.Corruption
         [SerializeField] private Color _unlockedColor = new Color(0.55f, 1f, 0.72f);
         [SerializeField] private bool _openOnStartIfAlreadyUnlocked = true;
 
+        [Tooltip("If true, this gate also opens when SandboxManager.OnSessionComplete fires. Used for the sandbox-exit door.")]
+        [SerializeField] private bool _openOnSessionComplete = false;
+
         private Vector3 _closedLocalPos;
         private Coroutine _openRoutine;
 
@@ -40,7 +43,11 @@ namespace AlgorithmicGallery.Corruption
             SetIndicator(_lockedColor);
 
             if (_sandbox != null)
+            {
                 _sandbox.OnHallwayUnlocked.AddListener(HandleHallwayUnlocked);
+                if (_openOnSessionComplete)
+                    _sandbox.OnSessionComplete.AddListener(HandleHallwayUnlocked);
+            }
 
             if (_openOnStartIfAlreadyUnlocked && _sandbox != null && _sandbox.HallwayUnlocked)
                 HandleHallwayUnlocked();
@@ -49,7 +56,11 @@ namespace AlgorithmicGallery.Corruption
         void OnDestroy()
         {
             if (_sandbox != null)
+            {
                 _sandbox.OnHallwayUnlocked.RemoveListener(HandleHallwayUnlocked);
+                if (_openOnSessionComplete)
+                    _sandbox.OnSessionComplete.RemoveListener(HandleHallwayUnlocked);
+            }
         }
 
         private void HandleHallwayUnlocked()

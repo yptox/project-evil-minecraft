@@ -7,22 +7,29 @@ using System.Collections;
 namespace AlgorithmicGallery.Corruption
 {
     // Handles player-driven prop placement.
-    // Raycasts to sandbox floor, shows a ghost preview, places on left-click.
+    // Raycasts to sandbox floor, shows a ghost preview, places on left-click (click-removal disabled).
     // Also used by AssistantSystem for autonomous placement (set isPlayerControlled=false).
     [RequireComponent(typeof(SculptureSpawner))]
     public class PropPlacer : MonoBehaviour
     {
         public event Action<bool> OnPropPlaced; // bool: true if player placed, false if assistant placed
+        /// <summary>Fired after a successful placement with context for scoring/UI (world position is above the placed model, for floaters).</summary>
+        public event Action<bool, PropEntry, Vector3> OnPropPlacedWithContext;
+        public event Action<bool> OnPropPlacementStarted; // bool: true if player placement started
         public event Action OnPropRemoved;
+        /// <summary>Fired when the player clicks while the post-placement "thinking" cooldown is active (placement blocked).</summary>
+        public event Action OnThinkingBlockedClick;
 
         [Header("Raycast")]
         [SerializeField] private LayerMask _placementLayerMask = ~0;
         [SerializeField] private float _maxPlacementDistance = 25f;
+        [Tooltip("Ray hit normal must be mostly upward (pedestal top), not prop sides.")]
+        [SerializeField] private float _minPedestalHitNormalY = 0.65f;
 
         [Header("Ghost Preview")]
         [SerializeField] private Material _ghostMaterial;
         [Tooltip("Ghost preview hovers this many units above the surface.")]
-        [SerializeField] private float _ghostHoverHeight = 0.05f;
+        [SerializeField] private float _ghostHoverHeight = 0.05f / 3f; // scaled with PropScaler sandbox shrink
 
         [Header("Placement")]
         [SerializeField] private Transform _sandboxRoot;
@@ -31,10 +38,10 @@ namespace AlgorithmicGallery.Corruption
         [Tooltip("If true, placement is constrained to sandbox root footprint (XZ).")]
         [SerializeField] private bool _restrictPlacementToSandboxFootprint = true;
         [Tooltip("Vertical offset above the detected floor surface to avoid z-fighting/intersection.")]
-        [SerializeField] private float _floorSurfaceOffset = 0.01f;
+        [SerializeField] private float _floorSurfaceOffset = 0.01f / 3f; // scaled with PropScaler sandbox shrink
         [Tooltip("Minimum distance between placed prop centers (player + assistant). 0 disables.")]
-        [SerializeField] private float _minPlacementSpacing = 0.4f;
-        [Tooltip("Max attempts to nudge a position to clear overlap before giving up.")]
+        [SerializeField] private float _minPlacementSpacing = 0.4f / 3f; // scaled with PropScaler sandbox shrink
+        [Tooltip("Max attempts to nudge a position to clear overlap before placement is rejected.")]
         [SerializeField] private int _antiOverlapAttempts = 6;
 
         [Header("Assistant Placement VFX")]
@@ -49,8 +56,14 @@ namespace AlgorithmicGallery.Corruption
         [SerializeField] private int _playerPlacementParticleCount = 20;
         [SerializeField] private Color _playerPlacementVfxColor = new Color(1f, 0.62f, 0.16f, 1f);
 
+        [Header("Player placement pacing")]
+        [Tooltip("After each successful player placement, hotbar shows a loading state and placement is blocked for this many seconds.")]
+        [SerializeField] private float _postPlacementThinkingSeconds = 2f;
+
         public bool IsPlayerControlled { get; set; } = true;
         public bool PlacementEnabled { get; set; } = false;
+        public float GlobalPlacedScaleMultiplier => _globalPlacedScaleMultiplier;
+        public float FloorSurfaceOffset => _floorSurfaceOffset;
 
         private SculptureSpawner _spawner;
         private HotbarController _hotbar;
@@ -91,7 +104,11 @@ namespace AlgorithmicGallery.Corruption
         {
             _sessionTime += Time.deltaTime;
 
-            if (!IsPlayerControlled || !PlacementEnabled) return;
+            if (!IsPlayerControlled || !PlacementEnabled)
+            {
+                DestroyGhost();
+                return;
+            }
 
             if (Input.GetKeyDown(KeyCode.Q))
                 _playerPlacementYaw = Mathf.Repeat(_playerPlacementYaw - 45f, 360f);
@@ -103,13 +120,18 @@ namespace AlgorithmicGallery.Corruption
             var es = UnityEngine.EventSystems.EventSystem.current;
             bool overUI = es != null && Cursor.lockState != CursorLockMode.Locked && es.IsPointerOverGameObject();
 
-            // Right-click = place (Minecraft style)
-            if (Input.GetMouseButtonDown(1) && !overUI)
-                TryPlaceAtCursor();
-
-            // Left-click = remove the prop you're looking at
+            // Left-click = place (click-removal disabled)
             if (Input.GetMouseButtonDown(0) && !overUI)
-                TryRemoveAtCursor();
+            {
+                if (_hotbar != null && _hotbar.IsInPostPlacementThinking)
+                {
+                    OnThinkingBlockedClick?.Invoke();
+                    GameplayEventDebugLog.Push("Hotbar", "placement blocked (thinking cooldown)");
+                    return;
+                }
+
+                TryPlaceAtCursor();
+            }
         }
 
         // Used by player and assistant placement paths.
@@ -127,30 +149,61 @@ namespace AlgorithmicGallery.Corruption
                 _isAssistantSpawning = true;
             }
 
-            worldPosition = ClampToSandboxFootprint(worldPosition);
+            OnPropPlacementStarted?.Invoke(isPlayerPlacement);
+
             float floorY = GetSandboxSurfaceY();
-            worldPosition.y = Mathf.Max(worldPosition.y, floorY) + _floorSurfaceOffset;
-            worldPosition = ResolveOverlap(worldPosition);
+            worldPosition = ClampToSandboxFootprint(worldPosition);
+            worldPosition.y = floorY + _floorSurfaceOffset;
+
+            if (!TryResolveNonOverlappingPlacement(ref worldPosition))
+            {
+                if (isPlayerPlacement)
+                    _isPlayerSpawning = false;
+                else
+                    _isAssistantSpawning = false;
+                return;
+            }
+
             var go = await SpawnProp(prop, worldPosition, yRotation);
+            Vector3 floaterAnchor = go != null ? GetWorldPointAbovePlacedModel(go, worldPosition) : worldPosition;
 
             if (go != null && isPlayerPlacement)
             {
-                _styleProfile.RecordPlacement(worldPosition, prop, _sessionTime, isPlayer: true);
-                _hotbar.ConsumeActiveSlot();
+                _styleProfile.RecordPlacement(
+                    go.transform.position,
+                    prop,
+                    _sessionTime,
+                    isPlayer: true,
+                    go.transform.rotation,
+                    go.transform.localScale);
+                _hotbar?.BeginPostPlacementThinking(_postPlacementThinkingSeconds);
                 _sandbox?.NotifyPlayerPlaced(worldPosition);
                 PropBudget.Instance?.Register(go, isPlayerPlaced: true);
+                OnPropPlacedWithContext?.Invoke(true, prop, floaterAnchor);
                 OnPropPlaced?.Invoke(true);
+                GameplayEventDebugLog.Push("Place", $"player placed \"{prop.DisplayName}\"");
                 SpawnPlayerPlacementVfx(go);
                 PlacementSoundLibrary.PlayPlacement(_placementAudioSource, prop.EmotionalTags?.ToArray(), isAssistant: false);
             }
             else if (go != null)
             {
-                _styleProfile.RecordPlacement(worldPosition, prop, _sessionTime, isPlayer: false);
+                _styleProfile.RecordPlacement(
+                    go.transform.position,
+                    prop,
+                    _sessionTime,
+                    isPlayer: false,
+                    go.transform.rotation,
+                    go.transform.localScale);
                 PropBudget.Instance?.Register(go, isPlayerPlaced: false);
+                OnPropPlacedWithContext?.Invoke(false, prop, floaterAnchor);
                 OnPropPlaced?.Invoke(false);
+                GameplayEventDebugLog.Push("Place", $"assistant placed \"{prop.DisplayName}\"");
                 SpawnAssistantPlacementVfx(go);
                 PlacementSoundLibrary.PlayPlacement(_placementAudioSource, prop.EmotionalTags?.ToArray(), isAssistant: true);
             }
+
+            if (go != null)
+                _sandbox?.NotifyPlacementRecorded();
 
             if (isPlayerPlacement)
                 _isPlayerSpawning = false;
@@ -158,8 +211,58 @@ namespace AlgorithmicGallery.Corruption
                 _isAssistantSpawning = false;
         }
 
+        /// <summary>
+        /// World-space point at the top center of the placed prop mesh/colliders so UI floaters sit above the model, not inside it.
+        /// </summary>
+        private static Vector3 GetWorldPointAbovePlacedModel(GameObject root, Vector3 floorFallback)
+        {
+            if (root == null) return floorFallback + Vector3.up * 0.35f;
+
+            bool has = false;
+            Bounds b = default;
+
+            foreach (var r in root.GetComponentsInChildren<Renderer>(true))
+            {
+                if (r == null) continue;
+                if (!has)
+                {
+                    b = r.bounds;
+                    has = true;
+                }
+                else
+                    b.Encapsulate(r.bounds);
+            }
+
+            if (!has)
+            {
+                foreach (var c in root.GetComponentsInChildren<Collider>(true))
+                {
+                    if (c == null || !c.enabled) continue;
+                    if (!has)
+                    {
+                        b = c.bounds;
+                        has = true;
+                    }
+                    else
+                        b.Encapsulate(c.bounds);
+                }
+            }
+
+            if (has)
+                return new Vector3(b.center.x, b.max.y, b.center.z);
+
+            float h = Mathf.Max(0.15f, root.transform.lossyScale.y * 0.5f);
+            return root.transform.position + Vector3.up * h;
+        }
+
         private void UpdateGhostPreview()
         {
+            if (_hotbar != null && _hotbar.IsInPostPlacementThinking)
+            {
+                DestroyGhost();
+                return;
+            }
+
             PropEntry active = _hotbar?.ActiveProp;
             if (active == null)
             {
@@ -176,14 +279,22 @@ namespace AlgorithmicGallery.Corruption
             if (_ghostInstance == null)
                 return;
 
-            if (!RaycastToFloor(out Vector3 hit))
+            if (!TryRaycastPedestalTop(out Vector3 flatPoint))
             {
                 _ghostInstance.SetActive(false);
                 return;
             }
 
+            if (!TryResolveNonOverlappingPlacement(ref flatPoint))
+            {
+                _ghostInstance.SetActive(false);
+                return;
+            }
+
+            flatPoint.y += _ghostHoverHeight;
+
             _ghostInstance.SetActive(true);
-            _ghostInstance.transform.position = hit + Vector3.up * _ghostHoverHeight;
+            _ghostInstance.transform.position = flatPoint;
             _ghostInstance.transform.rotation = Quaternion.Euler(0f, _playerPlacementYaw, 0f);
         }
 
@@ -195,7 +306,7 @@ namespace AlgorithmicGallery.Corruption
                 return;
             }
 
-            float scaleMult = PropScaler.ComputeScaleFactor(prop) * _globalPlacedScaleMultiplier;
+            float scaleMult = PropScaler.ComputeScaleFactor(prop, _globalPlacedScaleMultiplier);
             var loaded = await _spawner.LoadModel(
                 prop.GlbPath,
                 parent: transform,
@@ -270,61 +381,43 @@ namespace AlgorithmicGallery.Corruption
         private void TryPlaceAtCursor()
         {
             if (_isPlayerSpawning) return;
+            if (_hotbar != null && _hotbar.IsInPostPlacementThinking) return;
             if (_hotbar?.ActiveProp == null) return;
-            if (!RaycastToFloor(out Vector3 hit)) return;
+            if (!TryRaycastPedestalTop(out Vector3 hit)) return;
 
             float yRot = _playerPlacementYaw;
             _ = PlaceAt(_hotbar.ActiveProp, hit, yRot, isPlayerPlacement: true);
         }
 
-        // Left-click: destroy the placed prop under the cursor.
-        // Walks up the hit object's hierarchy to find the root prop container
-        // (the direct child of _sandboxRoot), so clicking any part of the model works.
-        private void TryRemoveAtCursor()
+        /// <summary>
+        /// Keeps XZ inside footprint; Y locked to pedestal top. Returns false if overlap cannot be cleared.
+        /// </summary>
+        private bool TryResolveNonOverlappingPlacement(ref Vector3 worldPos)
         {
-            var cam = Camera.main;
-            if (cam == null) return;
+            float floorY = GetSandboxSurfaceY();
+            worldPos = ClampToSandboxFootprint(worldPos);
+            worldPos.y = floorY + _floorSurfaceOffset;
 
-            Vector3 screenPos = Cursor.lockState == CursorLockMode.Locked
-                ? new Vector3(Screen.width * 0.5f, Screen.height * 0.5f, 0f)
-                : Input.mousePosition;
+            if (_minPlacementSpacing <= 0f || _sandboxRoot == null)
+                return true;
 
-            Ray ray = cam.ScreenPointToRay(screenPos);
-            if (!Physics.Raycast(ray, out RaycastHit hit, _maxPlacementDistance, _placementLayerMask)) return;
-
-            // Walk up until we find an object whose parent is the sandbox root.
-            // That's the prop container spawned by SculptureSpawner.
-            Transform t = hit.transform;
-            Transform root = _sandboxRoot != null ? _sandboxRoot : null;
-            if (root == null) return;
-
-            while (t != null && t.parent != root)
-                t = t.parent;
-
-            // Only destroy if we found a prop container (not the floor itself or unrelated objects)
-            if (t != null && t.parent == root && t != root)
-            {
-                PropBudget.Instance?.Unregister(t.gameObject);
-                Destroy(t.gameObject);
-                OnPropRemoved?.Invoke();
-            }
-        }
-
-        // Nudges the position outward in a spiral until no other placed prop is within minPlacementSpacing.
-        private Vector3 ResolveOverlap(Vector3 candidate)
-        {
-            if (_minPlacementSpacing <= 0f || _sandboxRoot == null) return candidate;
-
+            Vector3 candidate = worldPos;
             for (int attempt = 0; attempt < _antiOverlapAttempts; attempt++)
             {
                 if (!HasNearbyPlacedProp(candidate, _minPlacementSpacing))
-                    return candidate;
+                {
+                    worldPos = candidate;
+                    return true;
+                }
 
                 float angle = attempt * 1.13f * Mathf.PI;
                 float radius = _minPlacementSpacing * (0.6f + 0.3f * attempt);
                 candidate += new Vector3(Mathf.Cos(angle) * radius, 0f, Mathf.Sin(angle) * radius);
+                candidate = ClampToSandboxFootprint(candidate);
+                candidate.y = floorY + _floorSurfaceOffset;
             }
-            return candidate;
+
+            return false;
         }
 
         private bool HasNearbyPlacedProp(Vector3 worldPos, float radius)
@@ -353,33 +446,59 @@ namespace AlgorithmicGallery.Corruption
             return _sandboxRoot.position.y;
         }
 
-        private bool RaycastToFloor(out Vector3 hitPoint)
+        /// <summary>
+        /// Picks the closest ray hit that is on the pedestal (upward-facing), not on stacked props, inside footprint.
+        /// </summary>
+        private bool TryRaycastPedestalTop(out Vector3 hitPoint)
         {
             hitPoint = Vector3.zero;
             var cam = Camera.main;
             if (cam == null) return false;
 
-            // When cursor is locked (typical for FPS), aim from screen center; otherwise use cursor.
             Vector3 screenPos = Cursor.lockState == CursorLockMode.Locked
                 ? new Vector3(Screen.width * 0.5f, Screen.height * 0.5f, 0f)
                 : Input.mousePosition;
 
             Ray ray = cam.ScreenPointToRay(screenPos);
-            if (Physics.Raycast(ray, out RaycastHit hit, _maxPlacementDistance, _placementLayerMask))
+            int hitCount = Physics.RaycastNonAlloc(ray, RaycastScratch, _maxPlacementDistance, _placementLayerMask, QueryTriggerInteraction.Ignore);
+            if (hitCount <= 0) return false;
+
+            float floorY = GetSandboxSurfaceY();
+
+            bool found = false;
+            float bestDist = float.MaxValue;
+            Vector3 bestFlat = Vector3.zero;
+
+            for (int i = 0; i < hitCount; i++)
             {
+                RaycastHit hit = RaycastScratch[i];
+                if (hit.normal.y < _minPedestalHitNormalY)
+                    continue;
+
+                if (PropBudget.Instance != null && PropBudget.Instance.IsTrackedPlacedPropCollider(hit.collider))
+                    continue;
+
                 Vector3 point = hit.point;
                 if (_restrictPlacementToSandboxFootprint && !IsWithinSandboxFootprint(point))
-                    return false;
+                    continue;
 
-                float floorY = GetSandboxSurfaceY();
-                if (point.y < floorY)
-                    point.y = floorY;
-
-                hitPoint = point;
-                return true;
+                if (hit.distance < bestDist)
+                {
+                    bestDist = hit.distance;
+                    point.y = floorY + _floorSurfaceOffset;
+                    bestFlat = point;
+                    found = true;
+                }
             }
-            return false;
+
+            if (!found)
+                return false;
+
+            hitPoint = bestFlat;
+            return true;
         }
+
+        private static readonly RaycastHit[] RaycastScratch = new RaycastHit[64];
 
         private bool IsWithinSandboxFootprint(Vector3 worldPos)
         {
@@ -432,7 +551,7 @@ namespace AlgorithmicGallery.Corruption
         private async Task<GameObject> SpawnProp(PropEntry prop, Vector3 position, float yRotation)
         {
             var parent = _sandboxRoot != null ? _sandboxRoot : transform;
-            float scaleMult = PropScaler.ComputeScaleFactor(prop) * _globalPlacedScaleMultiplier;
+            float scaleMult = PropScaler.ComputeScaleFactor(prop, _globalPlacedScaleMultiplier);
             var go = await _spawner.LoadModel(
                 prop.GlbPath,
                 parent: parent,

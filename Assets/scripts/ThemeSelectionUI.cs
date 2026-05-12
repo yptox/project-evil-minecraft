@@ -1,6 +1,7 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Linq;
 using UnityEngine;
 using UnityEngine.EventSystems;
 using UnityEngine.UI;
@@ -10,6 +11,7 @@ namespace AlgorithmicGallery.Corruption
     public class ThemeSelectionUI : MonoBehaviour
     {
         public event Action<PromptDefinition> OnPromptSelected;
+        public event Action OnUiFadeOutComplete;
 
         [SerializeField] private Color _cardColor = new Color(0.08f, 0.08f, 0.1f, 0.92f);
         [SerializeField] private Color _cardHoverColor = new Color(0.14f, 0.14f, 0.18f, 0.95f);
@@ -18,11 +20,12 @@ namespace AlgorithmicGallery.Corruption
         [SerializeField] private Color _headerColor = new Color(1f, 0.55f, 0.2f);
         [SerializeField] private Color _systemColor = new Color(1f, 0.55f, 0.2f);
         [SerializeField] private float _promptTagDisplayDuration = 2.0f;   // regular prompts
-        [SerializeField] private float _customTagDisplayDuration  = 2.8f;  // custom input
+        [SerializeField] private float _customTagDisplayDuration  = 4.5f;  // custom input (animated flatten)
         [SerializeField] private float _uiFadeOutDuration = 0.45f;
 
         private Canvas _canvas;
         private CanvasGroup _canvasGroup;
+        private Image _rootBackgroundImage;
         private GameObject _selectionPanel;
         private GameObject _inputPanel;
         private GameObject _flattenPanel;
@@ -31,10 +34,10 @@ namespace AlgorithmicGallery.Corruption
         // Direct references to flatten panel text — avoids fragile Find() calls.
         private Text _flattenHeaderText;   // "you said: …"  /  "prompt text"
         private Text _flattenSubLabel;     // "the system understood:" / "tagged as:"
+        private Text _flattenStatusText; // "Formatting Marketability…"
         private Text _flattenTagsText;     // tag list
 
         private PromptDefinition[] _currentPrompts;
-        private SimplePlayerRig _frozenPlayerRig;
         private bool _hasSelected;
         private bool _isOpen;
 
@@ -42,17 +45,13 @@ namespace AlgorithmicGallery.Corruption
         public bool HasSelected => _hasSelected;
         public bool IsOpen => _isOpen;
 
+        // The 3 emotional/personal tags surfaced by the most recent flatten reveal.
+        // Read by SandboxManager so the scoring wall can label its personal rows.
+        public string[] LastFlattenedTags { get; private set; }
+
         void Awake()
         {
             BuildUI();
-        }
-
-        void Update()
-        {
-            // Continuously keep the rig frozen while the selection UI is open.
-            // Guards against execution-order races where Start() re-enables the rig.
-            if (!_hasSelected && _frozenPlayerRig != null && _frozenPlayerRig.enabled)
-                _frozenPlayerRig.enabled = false;
         }
 
         // ────────────────────────────────────────────────────────────────────
@@ -85,6 +84,7 @@ namespace AlgorithmicGallery.Corruption
             var bgImg = bg.AddComponent<Image>();
             bgImg.color = new Color(0f, 0f, 0f, 0.78f);
             bgImg.raycastTarget = true;
+            _rootBackgroundImage = bgImg;
 
             BuildSelectionPanel(canvasGO.transform);
             BuildInputPanel(canvasGO.transform);
@@ -119,7 +119,7 @@ namespace AlgorithmicGallery.Corruption
             headerText.fontSize = 48;
             headerText.color = _headerColor;
             headerText.alignment = TextAnchor.MiddleCenter;
-            headerText.text = "What would you like to create?";
+            headerText.text = "What space will you create?";
 
             CreateCustomCard(_selectionPanel.transform);
         }
@@ -227,7 +227,7 @@ namespace AlgorithmicGallery.Corruption
             promptText.color = _headerColor;
             promptText.alignment = TextAnchor.MiddleCenter;
             promptText.horizontalOverflow = HorizontalWrapMode.Wrap;
-            promptText.text = "Describe what you want to build.";
+            promptText.text = "What space will you create?";
 
             var sub = CreateChild(_inputPanel.transform, "Subtext");
             var subRect = sub.AddComponent<RectTransform>();
@@ -240,7 +240,7 @@ namespace AlgorithmicGallery.Corruption
             subText.fontSize = 22;
             subText.color = new Color(_textColor.r, _textColor.g, _textColor.b, 0.7f);
             subText.alignment = TextAnchor.MiddleCenter;
-            subText.text = "A memory, a feeling, a place. The system will read it.";
+            subText.text = "write something meaningful to you.";
 
             var inputBg = CreateChild(_inputPanel.transform, "InputBg");
             var inputRect = inputBg.AddComponent<RectTransform>();
@@ -310,29 +310,7 @@ namespace AlgorithmicGallery.Corruption
             submitLabelText.fontStyle = FontStyle.Bold;
             submitLabelText.color = Color.black;
             submitLabelText.alignment = TextAnchor.MiddleCenter;
-            submitLabelText.text = "Begin";
-
-            var back = CreateChild(_inputPanel.transform, "BackButton");
-            var backRect = back.AddComponent<RectTransform>();
-            backRect.anchorMin = new Vector2(0.42f, 0.18f);
-            backRect.anchorMax = new Vector2(0.58f, 0.24f);
-            backRect.offsetMin = Vector2.zero;
-            backRect.offsetMax = Vector2.zero;
-            var backImg = back.AddComponent<Image>();
-            backImg.color = new Color(1f, 1f, 1f, 0.04f);
-            var backBtn = back.AddComponent<Button>();
-            backBtn.targetGraphic = backImg;
-            backBtn.onClick.AddListener(ShowSelection);
-
-            var backLabel = CreateChild(back.transform, "Label");
-            var backLabelRect = backLabel.AddComponent<RectTransform>();
-            Stretch(backLabelRect);
-            var backLabelText = backLabel.AddComponent<Text>();
-            backLabelText.font = UiFontResolver.LoadVt323OrFallback();
-            backLabelText.fontSize = 22;
-            backLabelText.color = new Color(_textColor.r, _textColor.g, _textColor.b, 0.7f);
-            backLabelText.alignment = TextAnchor.MiddleCenter;
-            backLabelText.text = "← back to prompts";
+            submitLabelText.text = "Input";
         }
 
         // ────────────────────────────────────────────────────────────────────
@@ -347,52 +325,70 @@ namespace AlgorithmicGallery.Corruption
 
             var youSaid = CreateChild(_flattenPanel.transform, "YouSaid");
             var youSaidRect = youSaid.AddComponent<RectTransform>();
-            youSaidRect.anchorMin = new Vector2(0.1f, 0.55f);
-            youSaidRect.anchorMax = new Vector2(0.9f, 0.72f);
+            youSaidRect.anchorMin = new Vector2(0.04f, 0.70f);
+            youSaidRect.anchorMax = new Vector2(0.96f, 0.90f);
             youSaidRect.offsetMin = Vector2.zero;
             youSaidRect.offsetMax = Vector2.zero;
             _flattenHeaderText = youSaid.AddComponent<Text>();
             _flattenHeaderText.font = UiFontResolver.LoadVt323OrFallback();
-            _flattenHeaderText.fontSize = 28;
-            _flattenHeaderText.color = new Color(_textColor.r, _textColor.g, _textColor.b, 0.85f);
+            _flattenHeaderText.fontSize = 46;
+            _flattenHeaderText.color = new Color(_textColor.r, _textColor.g, _textColor.b, 0.92f);
             _flattenHeaderText.alignment = TextAnchor.MiddleCenter;
             _flattenHeaderText.horizontalOverflow = HorizontalWrapMode.Wrap;
+            _flattenHeaderText.verticalOverflow = VerticalWrapMode.Overflow;
             _flattenHeaderText.text = "";
+
+            var statusGo = CreateChild(_flattenPanel.transform, "StatusLine");
+            var statusRect = statusGo.AddComponent<RectTransform>();
+            statusRect.anchorMin = new Vector2(0.06f, 0.56f);
+            statusRect.anchorMax = new Vector2(0.94f, 0.66f);
+            statusRect.offsetMin = Vector2.zero;
+            statusRect.offsetMax = Vector2.zero;
+            _flattenStatusText = statusGo.AddComponent<Text>();
+            _flattenStatusText.font = UiFontResolver.LoadVt323OrFallback();
+            _flattenStatusText.fontSize = 34;
+            _flattenStatusText.fontStyle = FontStyle.Bold;
+            _flattenStatusText.color = new Color(_systemColor.r, _systemColor.g, _systemColor.b, 0.95f);
+            _flattenStatusText.alignment = TextAnchor.MiddleCenter;
+            _flattenStatusText.horizontalOverflow = HorizontalWrapMode.Wrap;
+            _flattenStatusText.text = "";
 
             var divider = CreateChild(_flattenPanel.transform, "Divider");
             var divRect = divider.AddComponent<RectTransform>();
-            divRect.anchorMin = new Vector2(0.4f, 0.49f);
-            divRect.anchorMax = new Vector2(0.6f, 0.495f);
+            divRect.anchorMin = new Vector2(0.35f, 0.498f);
+            divRect.anchorMax = new Vector2(0.65f, 0.505f);
             divRect.offsetMin = Vector2.zero;
             divRect.offsetMax = Vector2.zero;
             var divImg = divider.AddComponent<Image>();
-            divImg.color = new Color(_systemColor.r, _systemColor.g, _systemColor.b, 0.6f);
+            divImg.color = new Color(_systemColor.r, _systemColor.g, _systemColor.b, 0.55f);
 
             var heard = CreateChild(_flattenPanel.transform, "Heard");
             var heardRect = heard.AddComponent<RectTransform>();
-            heardRect.anchorMin = new Vector2(0.1f, 0.30f);
-            heardRect.anchorMax = new Vector2(0.9f, 0.46f);
+            heardRect.anchorMin = new Vector2(0.06f, 0.38f);
+            heardRect.anchorMax = new Vector2(0.94f, 0.52f);
             heardRect.offsetMin = Vector2.zero;
             heardRect.offsetMax = Vector2.zero;
             _flattenSubLabel = heard.AddComponent<Text>();
             _flattenSubLabel.font = UiFontResolver.LoadVt323OrFallback();
-            _flattenSubLabel.fontSize = 20;
-            _flattenSubLabel.color = new Color(_systemColor.r, _systemColor.g, _systemColor.b, 0.85f);
-            _flattenSubLabel.alignment = TextAnchor.UpperCenter;
+            _flattenSubLabel.fontSize = 28;
+            _flattenSubLabel.color = new Color(_systemColor.r, _systemColor.g, _systemColor.b, 0.9f);
+            _flattenSubLabel.alignment = TextAnchor.MiddleCenter;
+            _flattenSubLabel.horizontalOverflow = HorizontalWrapMode.Wrap;
             _flattenSubLabel.text = "the system understood:";
 
             var tagsGO = CreateChild(_flattenPanel.transform, "Tags");
             var tagsRect = tagsGO.AddComponent<RectTransform>();
-            tagsRect.anchorMin = new Vector2(0.1f, 0.22f);
-            tagsRect.anchorMax = new Vector2(0.9f, 0.32f);
+            tagsRect.anchorMin = new Vector2(0.05f, 0.10f);
+            tagsRect.anchorMax = new Vector2(0.95f, 0.34f);
             tagsRect.offsetMin = Vector2.zero;
             tagsRect.offsetMax = Vector2.zero;
             _flattenTagsText = tagsGO.AddComponent<Text>();
             _flattenTagsText.font = UiFontResolver.LoadVt323OrFallback();
-            _flattenTagsText.fontSize = 36;
+            _flattenTagsText.fontSize = 52;
             _flattenTagsText.fontStyle = FontStyle.Bold;
             _flattenTagsText.color = _systemColor;
             _flattenTagsText.alignment = TextAnchor.MiddleCenter;
+            _flattenTagsText.horizontalOverflow = HorizontalWrapMode.Wrap;
             _flattenTagsText.text = "";
         }
 
@@ -401,6 +397,9 @@ namespace AlgorithmicGallery.Corruption
         // ────────────────────────────────────────────────────────────────────
         private void ShowSelection()
         {
+            if (_rootBackgroundImage != null)
+                _rootBackgroundImage.color = new Color(0f, 0f, 0f, 0.78f);
+
             _selectionPanel.SetActive(true);
             _inputPanel.SetActive(false);
             _flattenPanel.SetActive(false);
@@ -408,13 +407,12 @@ namespace AlgorithmicGallery.Corruption
 
         private void ShowInput()
         {
-            // Re-assert cursor and rig state — guards against execution-order races.
+            if (_rootBackgroundImage != null)
+                _rootBackgroundImage.color = new Color(0f, 0f, 0f, 0.78f);
+
+            PlayerInputFreeze.FreezePlayerLocomotion();
             Cursor.lockState = CursorLockMode.None;
             Cursor.visible = true;
-            if (_frozenPlayerRig == null)
-                _frozenPlayerRig = FindFirstObjectByType<SimplePlayerRig>();
-            if (_frozenPlayerRig != null)
-                _frozenPlayerRig.enabled = false;
 
             _selectionPanel.SetActive(false);
             _inputPanel.SetActive(true);
@@ -451,9 +449,17 @@ namespace AlgorithmicGallery.Corruption
             _inputPanel.SetActive(false);
             _flattenPanel.SetActive(true);
 
+            if (_rootBackgroundImage != null)
+                _rootBackgroundImage.color = new Color(0f, 0f, 0f, 0.96f);
+
             if (_flattenHeaderText != null) _flattenHeaderText.text = headerText;
             if (_flattenSubLabel   != null) _flattenSubLabel.text   = subHeaderText;
             if (_flattenTagsText   != null) _flattenTagsText.text   = string.Join("   ·   ", tags);
+            if (_flattenStatusText != null)
+            {
+                _flattenStatusText.text = "";
+                SetTextAlpha(_flattenStatusText, 0f);
+            }
         }
 
         // ────────────────────────────────────────────────────────────────────
@@ -461,15 +467,23 @@ namespace AlgorithmicGallery.Corruption
         // ────────────────────────────────────────────────────────────────────
 
         // Called when the player clicks a pre-defined prompt card.
-        // Shows the tag reveal for 2 seconds before entering the sandbox.
+        // Shows the animated flatten reveal before entering the sandbox.
         private void PreviewAndSelectPrompt(PromptDefinition prompt)
         {
             if (_hasSelected) return;
-            var tags = new List<string>(prompt.EmotionalTags ?? Array.Empty<string>());
-            // Show at most 4 tags so the reveal line stays readable.
-            if (tags.Count > 4) tags = tags.GetRange(0, 4);
-            ShowFlatten($"\"{prompt.DisplayText}\"", "the system will look for:", tags);
-            StartCoroutine(FlattenThenSelect(prompt, _promptTagDisplayDuration));
+            PlayerInputFreeze.FreezePlayerLocomotion();
+            Cursor.lockState = CursorLockMode.None;
+            Cursor.visible = true;
+
+            PromptScoringHelper.EnsureCorporateTarget(prompt);
+            string[] tags = PromptScoringHelper.BuildThreeFlattenLabels(prompt);
+
+            LastFlattenedTags = tags;
+
+            string header = $"\"{prompt.DisplayText}\"";
+            string sub = "Target engagement vectors assigned:";
+            ShowFlatten(header, sub, tags);
+            StartCoroutine(FlattenAnimateThenSelect(prompt, header, sub, tags, _promptTagDisplayDuration));
         }
 
         private void SubmitCustom(string text)
@@ -483,17 +497,143 @@ namespace AlgorithmicGallery.Corruption
             }
 
             var result = PromptParser.Parse(trimmed);
-            string summary =
-                $"the system understood: confidence {Mathf.RoundToInt(result.Confidence * 100f)}% | " +
-                $"collapse {Mathf.RoundToInt(result.CollapseSeverity * 100f)}%";
-            ShowFlatten($"you said:\n\"{trimmed}\"", summary, result.MatchedEmotionalTags);
-            StartCoroutine(FlattenThenSelect(result.Prompt, _customTagDisplayDuration));
+            PromptScoringHelper.EnsureCorporateTarget(result.Prompt);
+            string[] tags = PromptScoringHelper.BuildThreeFlattenLabels(result.Prompt);
+
+            LastFlattenedTags = tags;
+
+            string summary = result.CollapseSeverity > 0.55f
+                ? "Input normalised. Consumer categories assigned."
+                : "Target engagement vectors assigned.";
+            string header = $"you said:\n\"{trimmed}\"";
+
+            ShowFlatten(header, summary, tags);
+            StartCoroutine(FlattenAnimateThenSelect(result.Prompt, header, summary, tags, _customTagDisplayDuration));
         }
 
-        private IEnumerator FlattenThenSelect(PromptDefinition prompt, float duration)
+        // Animated flatten: prompt fades in, holds, "squishes" (font shrinks), and crossfades to tags.
+        // Total runtime targets ~`duration` seconds; uses unscaled time so it is safe across time-manipulation.
+        private IEnumerator FlattenAnimateThenSelect(
+            PromptDefinition prompt,
+            string headerText,
+            string subText,
+            string[] tags,
+            float duration)
         {
-            yield return new WaitForSecondsRealtime(duration);
+            const float headerFadeIn = 0.4f;
+            const float subHold = 0.6f;
+            const float squish = 1.2f;
+            const float crossfade = 0.8f;
+            const float tagHoldBase = 1.5f;
+            const float statusFadeIn = 0.28f;
+            const float statusHoldA = 0.55f;
+            const float statusHoldB = 0.72f;
+            const float statusFadeOut = 0.25f;
+            float statusBlock = statusFadeIn + statusHoldA + statusHoldB + statusFadeOut;
+
+            float originalHeaderSize = _flattenHeaderText != null ? _flattenHeaderText.fontSize : 46;
+
+            SetTextAlpha(_flattenHeaderText, 0f);
+            SetTextAlpha(_flattenSubLabel, 0f);
+            SetTextAlpha(_flattenTagsText, 0f);
+            SetTextAlpha(_flattenStatusText, 0f);
+            yield return AnimateTextAlpha(_flattenHeaderText, 0f, 1f, headerFadeIn);
+
+            yield return AnimateTextAlpha(_flattenSubLabel, 0f, 1f, 0.2f);
+            yield return WaitUnscaled(subHold);
+
+            PromptScoringHelper.EnsureCorporateTarget(prompt);
+            string noun = PromptScoringHelper.CorporateFormattingNoun(prompt.CorporateTargetTag ?? "marketable");
+            if (_flattenStatusText != null)
+            {
+                _flattenStatusText.text = $"Formatting {noun}…";
+                yield return AnimateTextAlpha(_flattenStatusText, 0f, 1f, statusFadeIn);
+                yield return WaitUnscaled(statusHoldA);
+                _flattenStatusText.text = "Analysing Target Audience…";
+                yield return WaitUnscaled(statusHoldB);
+                yield return AnimateTextAlpha(_flattenStatusText, 1f, 0f, statusFadeOut);
+            }
+            else
+                yield return WaitUnscaled(statusBlock);
+
+            yield return AnimateFontSize(_flattenHeaderText, originalHeaderSize, Mathf.Max(8, Mathf.RoundToInt(originalHeaderSize * 0.36f)), squish);
+
+            yield return CrossfadeAlpha(_flattenHeaderText, _flattenTagsText, crossfade);
+
+            float consumed = headerFadeIn + 0.2f + subHold + statusBlock + squish + crossfade;
+            float hold = Mathf.Max(tagHoldBase, duration - consumed);
+            yield return WaitUnscaled(hold);
+
+            if (_flattenHeaderText != null)
+                _flattenHeaderText.fontSize = Mathf.RoundToInt(originalHeaderSize);
+
             SelectPrompt(prompt);
+        }
+
+        private static IEnumerator WaitUnscaled(float seconds)
+        {
+            float t = 0f;
+            while (t < seconds)
+            {
+                t += Time.unscaledDeltaTime;
+                yield return null;
+            }
+        }
+
+        private static IEnumerator AnimateTextAlpha(Text text, float from, float to, float duration)
+        {
+            if (text == null) yield break;
+            duration = Mathf.Max(0.01f, duration);
+            float t = 0f;
+            while (t < duration)
+            {
+                t += Time.unscaledDeltaTime;
+                float k = Mathf.Clamp01(t / duration);
+                SetTextAlpha(text, Mathf.Lerp(from, to, k));
+                yield return null;
+            }
+            SetTextAlpha(text, to);
+        }
+
+        private static IEnumerator AnimateFontSize(Text text, float from, float to, float duration)
+        {
+            if (text == null) yield break;
+            duration = Mathf.Max(0.01f, duration);
+            float t = 0f;
+            while (t < duration)
+            {
+                t += Time.unscaledDeltaTime;
+                float k = Mathf.Clamp01(t / duration);
+                // Ease in cubic — pressure builds.
+                float eased = k * k * k;
+                text.fontSize = Mathf.Max(1, Mathf.RoundToInt(Mathf.Lerp(from, to, eased)));
+                yield return null;
+            }
+            text.fontSize = Mathf.Max(1, Mathf.RoundToInt(to));
+        }
+
+        private static IEnumerator CrossfadeAlpha(Text fadeOut, Text fadeIn, float duration)
+        {
+            duration = Mathf.Max(0.01f, duration);
+            float t = 0f;
+            while (t < duration)
+            {
+                t += Time.unscaledDeltaTime;
+                float k = Mathf.Clamp01(t / duration);
+                SetTextAlpha(fadeOut, 1f - k);
+                SetTextAlpha(fadeIn, k);
+                yield return null;
+            }
+            SetTextAlpha(fadeOut, 0f);
+            SetTextAlpha(fadeIn, 1f);
+        }
+
+        private static void SetTextAlpha(Text text, float alpha)
+        {
+            if (text == null) return;
+            var c = text.color;
+            c.a = Mathf.Clamp01(alpha);
+            text.color = c;
         }
 
         private void SelectPrompt(PromptDefinition prompt)
@@ -509,12 +649,7 @@ namespace AlgorithmicGallery.Corruption
 
             StartCoroutine(FadeOutAndCloseUi());
 
-            // Re-enable player movement and re-lock cursor.
-            if (_frozenPlayerRig != null)
-            {
-                _frozenPlayerRig.enabled = true;
-                _frozenPlayerRig = null;
-            }
+            PlayerInputFreeze.RestorePlayerLocomotion();
 
             Cursor.lockState = CursorLockMode.Locked;
             Cursor.visible = false;
@@ -542,6 +677,10 @@ namespace AlgorithmicGallery.Corruption
 
             if (_canvas != null)
                 Destroy(_canvas.gameObject, 0.05f);
+
+            // Fire event when UI fade is complete
+            OnUiFadeOutComplete?.Invoke();
+            Debug.Log("[ThemeSelectionUI] UI fade out complete.");
         }
 
         // ────────────────────────────────────────────────────────────────────

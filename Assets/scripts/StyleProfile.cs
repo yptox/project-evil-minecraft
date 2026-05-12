@@ -8,6 +8,10 @@ namespace AlgorithmicGallery.Corruption
     public class PlacementRecord
     {
         public Vector3 Position;
+        /// <summary>World-space rotation of the placed prop root after spawn.</summary>
+        public Quaternion Rotation;
+        /// <summary>Local scale of the placed prop root (under sandbox parent).</summary>
+        public Vector3 LocalScale;
         public string Group;
         public string GlbPath;
         public List<string> Tags;
@@ -37,10 +41,24 @@ namespace AlgorithmicGallery.Corruption
 
         public void RecordPlacement(Vector3 worldPos, PropEntry prop, float sessionTime, bool isPlayer = true)
         {
+            RecordPlacement(worldPos, prop, sessionTime, isPlayer, Quaternion.identity, Vector3.one);
+        }
+
+        /// <summary>Records a placement including the spawned instance transform for exact replay export.</summary>
+        public void RecordPlacement(
+            Vector3 worldPos,
+            PropEntry prop,
+            float sessionTime,
+            bool isPlayer,
+            Quaternion rotation,
+            Vector3 localScale)
+        {
             var emotionalTags = prop.EmotionalTags != null ? new List<string>(prop.EmotionalTags) : new List<string>();
             var record = new PlacementRecord
             {
                 Position = worldPos,
+                Rotation = rotation,
+                LocalScale = localScale,
                 Group = prop.Group,
                 GlbPath = prop.GlbPath,
                 Tags = new List<string>(prop.Tags),

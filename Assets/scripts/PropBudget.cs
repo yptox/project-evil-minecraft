@@ -63,6 +63,23 @@ namespace AlgorithmicGallery.Corruption
             }
         }
 
+        /// <summary>
+        /// Used by placement raycasts to ignore stacked props — only the pedestal top should register.
+        /// </summary>
+        public bool IsTrackedPlacedPropCollider(Collider col)
+        {
+            if (col == null) return false;
+            Transform t = col.transform;
+            for (int i = _tracked.Count - 1; i >= 0; i--)
+            {
+                GameObject go = _tracked[i].Go;
+                if (go == null) continue;
+                if (t == go.transform || t.IsChildOf(go.transform))
+                    return true;
+            }
+            return false;
+        }
+
         private void EnforceBudget()
         {
             // Drop dead refs

@@ -36,6 +36,14 @@ namespace AlgorithmicGallery
         private bool _forceGrowthShaderMaterialOverride = true;
         [SerializeField]
         private bool _copyBaseTextureFromSource = true;
+        [SerializeField]
+        private bool _skipMaterialCompatibilityPass = false;
+
+        // Runtime API for context-specific material behavior (e.g. curation preview vs gameplay).
+        public void SetForceGrowthShaderMaterialOverride(bool enabled) => _forceGrowthShaderMaterialOverride = enabled;
+        public bool IsForceGrowthShaderMaterialOverrideEnabled => _forceGrowthShaderMaterialOverride;
+        public void SetSkipMaterialCompatibilityPass(bool enabled) => _skipMaterialCompatibilityPass = enabled;
+        public bool IsSkippingMaterialCompatibilityPass => _skipMaterialCompatibilityPass;
 
         private void Awake()
         {
@@ -113,7 +121,8 @@ namespace AlgorithmicGallery
                 return null;
             }
 
-            ApplyGrowthMaterialCompatibility(container);
+            if (!_skipMaterialCompatibilityPass)
+                ApplyGrowthMaterialCompatibility(container);
             DisableImportedCollidersUnder(container.transform);
 
             if (!TryGetRendererBounds(container, out Bounds bounds))

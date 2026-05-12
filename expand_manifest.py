@@ -1,5 +1,428 @@
 #!/usr/bin/env python3
 """
+expand_manifest.py — bulk-ingest additional GLBs into curated-props.json.
+
+This script intentionally adds *stub* prop entries (id/path/display_name/group/emotional_tags, etc.)
+and relies on curate_pipeline.py to:
+  - validate GLB structure + geometry
+  - measure real dimensions from POSITION accessor AABB
+  - compute size_category / confidence / vertex_count
+  - remove invalid/bad-scale assets
+
+Run from project root:
+  python3 expand_manifest.py --max-add 2000
+  python3 curate_pipeline.py
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import math
+import struct
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, List, Sequence, Set, Tuple
+
+
+MODELS_ROOT = Path("Assets/StreamingAssets/models")
+MANIFEST_PATH = Path("Assets/StreamingAssets/curated-props.json")
+
+OVERSIZED_AXIS_M = 1.8  # keep < 1.8m (pipeline labels >=1.8 as oversized)
+
+
+# -----------------------------------------------------------------------------
+# Skip rules (folder + filename heuristics)
+# -----------------------------------------------------------------------------
+
+SKIP_PATH_PARTS: Tuple[str, ...] = (
+    "gibs/",
+    "deadbodies/",
+    "infected/",
+    "foliage/",
+    "player/",
+    "humans/",
+    "npcs/",
+    "props_vehicles/",
+    "props_foliage/",
+    "props_rocks/",
+    "props_debris/",
+    "props_junk/",
+    "props_wasteland/",
+    "props_combine/",
+    "props_c17/",
+    "props_silo/",
+    "props_pipes/",
+    "props_windows/",
+    "props_doors/",
+    "props_highway/",
+    "props_buildables/",
+    "props_bts/",
+    "props_destruction/",
+    "a4_destruction/",
+    "props_map_editor/",
+    "props_underground/",
+    "props_exteriors/",
+    "lighthouse/",
+    "lostcoast/",
+    "props_mill/",
+)
+
+SKIP_FNAME_SUFFIXES: Tuple[str, ...] = (
+    "_reference",
+    "_lod1",
+    "_lod2",
+    "_lod3",
+    "_skybox",
+)
+
+SKIP_FNAME_CONTAINS: Tuple[str, ...] = (
+    "vortigaunt",
+    "stalker",
+    "scanner",
+    "strider",
+    "hunter",
+    "roller",
+    "zombie",
+    "survivor",
+    "witch",
+    "smoker",
+    "boomer",
+    "jockey",
+    "charger",
+    "spitter",
+)
+
+_GIB_RE = re.compile(r"(?:_gib\\d+|_chunk\\d+)$", re.IGNORECASE)
+_DAMAGE_RE = re.compile(r"(?:_damage(?:_\\d+)?|_dam\\d+[a-z]?)$", re.IGNORECASE)
+
+
+def should_skip(rel_path: str) -> bool:
+    p = rel_path.replace("\\\\", "/").lower()
+    fname = p.split("/")[-1]
+    stem = fname[:-4] if fname.endswith(".glb") else fname
+
+    if any(part in p for part in SKIP_PATH_PARTS):
+        return True
+
+    if "skybox" in stem:
+        return True
+
+    if _GIB_RE.search(stem) is not None:
+        return True
+    if _DAMAGE_RE.search(stem) is not None:
+        return True
+
+    if any(stem.endswith(suf) for suf in SKIP_FNAME_SUFFIXES):
+        return True
+
+    if any(tok in stem for tok in SKIP_FNAME_CONTAINS):
+        return True
+
+    return False
+
+
+# -----------------------------------------------------------------------------
+# Lightweight AABB extraction (copied conceptually from curate_pipeline.py)
+# -----------------------------------------------------------------------------
+
+def _read_glb_json(path: Path) -> dict:
+    with open(path, "rb") as fh:
+        raw = fh.read()
+
+    if len(raw) < 20:
+        raise ValueError("File too small")
+
+    magic, version, total_len = struct.unpack_from("<4sII", raw, 0)
+    if magic != b"glTF":
+        raise ValueError("Bad magic")
+    if version not in (1, 2):
+        raise ValueError("Unsupported GLB version")
+    if total_len > len(raw):
+        raise ValueError("Truncated GLB")
+
+    chunk0_len, chunk0_type = struct.unpack_from("<I4s", raw, 12)
+    if chunk0_type != b"JSON":
+        raise ValueError("First chunk not JSON")
+
+    json_bytes = raw[20 : 20 + chunk0_len]
+    return json.loads(json_bytes)
+
+
+def _extract_longest_axis(gltf: dict) -> float:
+    """
+    Extract a global longest axis length from POSITION accessor min/max.
+    Returns 0 if no positional data found.
+    """
+    accessors = gltf.get("accessors", [])
+    meshes = gltf.get("meshes", [])
+
+    position_indices = set()
+    for mesh in meshes:
+        for prim in mesh.get("primitives", []):
+            pos_idx = prim.get("attributes", {}).get("POSITION")
+            if pos_idx is not None:
+                position_indices.add(pos_idx)
+
+    if not position_indices:
+        return 0.0
+
+    global_min = [math.inf, math.inf, math.inf]
+    global_max = [-math.inf, -math.inf, -math.inf]
+
+    for idx in position_indices:
+        if idx >= len(accessors):
+            continue
+        acc = accessors[idx]
+        amin = acc.get("min")
+        amax = acc.get("max")
+        if amin and amax and len(amin) == 3 and len(amax) == 3:
+            for i in range(3):
+                global_min[i] = min(global_min[i], amin[i])
+                global_max[i] = max(global_max[i], amax[i])
+
+    if math.isinf(global_min[0]):
+        return 0.0
+
+    dx = abs(global_max[0] - global_min[0])
+    dy = abs(global_max[1] - global_min[1])
+    dz = abs(global_max[2] - global_min[2])
+    return float(max(dx, dy, dz))
+
+
+def is_oversized_glb(full_path: Path, max_longest_axis_m: float) -> bool:
+    """
+    Returns True if the model's longest axis is >= threshold.
+    If the model can't be measured, treat it as oversized (skip) to be safe.
+    """
+    try:
+        gltf = _read_glb_json(full_path)
+        longest = _extract_longest_axis(gltf)
+        if longest <= 0.001:
+            return True
+        return longest >= max_longest_axis_m
+    except Exception:
+        return True
+
+
+# -----------------------------------------------------------------------------
+# Folder → metadata defaults
+# -----------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class FolderRule:
+    group: str
+    emotional_tags: Tuple[str, ...]
+
+
+FOLDER_RULES: List[Tuple[str, FolderRule]] = [
+    ("dod/props_misc/", FolderRule("domestic", ("comforting", "domestic", "nostalgic"))),
+    ("dod/props_furniture/", FolderRule("furniture", ("domestic", "nostalgic", "mundane"))),
+    ("tf2/props_hearth/", FolderRule("domestic", ("comforting", "intimate", "nostalgic"))),
+    ("tf2/props_manor/", FolderRule("domestic", ("comforting", "intimate", "nostalgic"))),
+    ("tf2/props_medieval/", FolderRule("workshop", ("nostalgic", "personal", "mundane"))),
+    ("tf2/props_frontline/", FolderRule("item", ("abandoned", "mundane", "nostalgic"))),
+    ("tf2/props_embargo/", FolderRule("furniture", ("public", "mundane", "personal"))),
+    ("tf2/props_farm/", FolderRule("workshop", ("nostalgic", "domestic", "mundane"))),
+    ("tf2/props_mining/", FolderRule("workshop", ("mundane", "abandoned", "nostalgic"))),
+    ("tf2/props_coalmines/", FolderRule("workshop", ("mundane", "abandoned", "nostalgic"))),
+    ("tf2/props_halloween/", FolderRule("item", ("melancholy", "intimate", "nostalgic"))),
+    ("tf2/props_mall/", FolderRule("retail", ("public", "mundane", "liminal"))),
+    ("l4d2/props_mall/", FolderRule("retail", ("public", "mundane", "liminal"))),
+    ("tf2/props_soho/", FolderRule("retail", ("public", "mundane", "nostalgic"))),
+    ("tf2/props_tuscany/", FolderRule("retail", ("public", "mundane", "nostalgic"))),
+    ("tf2/props_2fort/", FolderRule("workshop", ("mundane", "institutional", "abandoned"))),
+    ("tf2/props_mvm/", FolderRule("workshop", ("mundane", "institutional", "abandoned"))),
+    ("l4d2/props_fairgrounds/", FolderRule("item", ("melancholy", "liminal", "nostalgic"))),
+    ("l4d2/props_urban/", FolderRule("retail", ("public", "mundane", "abandoned"))),
+    ("l4d2/props_street/", FolderRule("retail", ("public", "mundane", "abandoned"))),
+    ("l4d2/props_unique/", FolderRule("workshop", ("abandoned", "institutional", "mundane"))),
+    ("l4d2/props_industrial/", FolderRule("workshop", ("abandoned", "institutional", "mundane"))),
+    ("portal2/props_office/", FolderRule("office", ("institutional", "mundane", "personal"))),
+    ("portal2/props/", FolderRule("lab", ("clinical", "institutional", "liminal"))),
+    ("portal/props/", FolderRule("lab", ("clinical", "institutional", "liminal"))),
+    ("css/props/", FolderRule("item", ("mundane", "public", "institutional"))),
+]
+
+
+def infer_rule(rel_path: str) -> FolderRule:
+    p = rel_path.replace("\\\\", "/").lower()
+    for prefix, rule in FOLDER_RULES:
+        if p.startswith(prefix):
+            return rule
+    return FolderRule("item", ("mundane", "personal"))
+
+
+# -----------------------------------------------------------------------------
+# Naming helpers
+# -----------------------------------------------------------------------------
+
+_TRAILING_VARIANTS_RE = re.compile(r"(?:\\b(?:lod|ref)\\b\\d*|(?:\\d{2,3})|[a-z])$", re.IGNORECASE)
+
+
+def make_id(rel_path: str) -> str:
+    s = rel_path.replace("\\\\", "/").lower()
+    s = s[:-4] if s.endswith(".glb") else s
+    s = re.sub(r"[^a-z0-9]+", "_", s).strip("_")
+    return s
+
+
+def make_display_name(rel_path: str) -> str:
+    fname = rel_path.replace("\\\\", "/").split("/")[-1]
+    stem = fname[:-4] if fname.lower().endswith(".glb") else fname
+    stem = stem.replace("_", " ").replace("-", " ").strip()
+    stem = re.sub(r"\\s+", " ", stem)
+
+    tokens = stem.split(" ")
+    while tokens and _TRAILING_VARIANTS_RE.match(tokens[-1]):
+        tokens.pop()
+    if not tokens:
+        tokens = [stem]
+
+    text = " ".join(tokens).strip() or stem
+    return text.title()
+
+
+def infer_category(rel_path: str) -> str:
+    parts = rel_path.replace("\\\\", "/").split("/")
+    return parts[1] if len(parts) >= 2 else "misc"
+
+
+# -----------------------------------------------------------------------------
+# Manifest update
+# -----------------------------------------------------------------------------
+
+def load_manifest() -> dict:
+    if not MANIFEST_PATH.exists():
+        raise FileNotFoundError(f"Manifest not found: {MANIFEST_PATH}")
+    with open(MANIFEST_PATH) as f:
+        return json.load(f)
+
+
+def save_manifest(data: dict) -> None:
+    with open(MANIFEST_PATH, "w") as f:
+        json.dump(data, f, separators=(",", ":"))
+
+
+def iter_all_glbs(models_root: Path) -> Iterable[str]:
+    for root, _, files in os.walk(models_root):
+        for fn in files:
+            if not fn.lower().endswith(".glb"):
+                continue
+            full = Path(root) / fn
+            yield str(full.relative_to(models_root)).replace("\\\\", "/")
+
+
+def build_existing_sets(props: Sequence[dict]) -> Tuple[Set[str], Set[str]]:
+    paths: Set[str] = set()
+    ids: Set[str] = set()
+    for p in props:
+        gp = p.get("glb_path")
+        pid = p.get("id")
+        if gp:
+            paths.add(str(gp).replace("\\\\", "/"))
+        if pid:
+            ids.add(str(pid))
+    return paths, ids
+
+
+def make_stub_entry(rel_path: str) -> dict:
+    rule = infer_rule(rel_path)
+    pid = make_id(rel_path)
+    return {
+        "id": pid,
+        "glb_path": rel_path,
+        "display_name": make_display_name(rel_path),
+        "group": rule.group,
+        "category": infer_category(rel_path),
+        "tags": [],
+        "poly_count": 0,
+        "dimensions": {"x": 0.0, "y": 0.0, "z": 0.0},
+        "emotional_tags": list(rule.emotional_tags),
+        "size_category": "unknown",
+        "confidence": 1.0,
+        "vertex_count": 0,
+    }
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Bulk-add candidate GLBs to curated-props.json (stubs only).")
+    ap.add_argument("--max-add", type=int, default=2000, help="Maximum number of new entries to add (default 2000)")
+    ap.add_argument(
+        "--max-longest-axis",
+        type=float,
+        default=OVERSIZED_AXIS_M,
+        help="Skip models whose measured longest axis is >= this many metres (default 1.8; avoids oversized props).",
+    )
+    ap.add_argument("--dry-run", action="store_true", help="Do not write; just print counts")
+    args = ap.parse_args()
+
+    data = load_manifest()
+    props: List[dict] = list(data.get("props", []))
+    existing_paths, existing_ids = build_existing_sets(props)
+
+    added = 0
+    skipped_existing = 0
+    skipped_rules = 0
+    skipped_missing = 0
+    skipped_oversized = 0
+    groups: Set[str] = set(data.get("groups", []))
+
+    for rel in iter_all_glbs(MODELS_ROOT):
+        if rel in existing_paths:
+            skipped_existing += 1
+            continue
+        if should_skip(rel):
+            skipped_rules += 1
+            continue
+        full_path = MODELS_ROOT / rel
+        if not full_path.exists():
+            skipped_missing += 1
+            continue
+        if is_oversized_glb(full_path, args.max_longest_axis):
+            skipped_oversized += 1
+            continue
+
+        entry = make_stub_entry(rel)
+        if entry["id"] in existing_ids:
+            # extremely unlikely unless paths collide after normalization
+            skipped_rules += 1
+            continue
+
+        props.append(entry)
+        existing_paths.add(rel)
+        existing_ids.add(entry["id"])
+        groups.add(entry["group"])
+        added += 1
+        if added >= max(0, args.max_add):
+            break
+
+    print("[expand_manifest] Existing props:", len(data.get("props", [])))
+    print("[expand_manifest] Added:", added)
+    print("[expand_manifest] Skipped existing:", skipped_existing)
+    print("[expand_manifest] Skipped by rules:", skipped_rules)
+    print("[expand_manifest] Skipped missing:", skipped_missing)
+    print("[expand_manifest] Skipped oversized:", skipped_oversized)
+
+    if args.dry_run:
+        print("[expand_manifest] DRY RUN — no files written.")
+        return 0
+
+    data["props"] = props
+    data["total"] = len(props)
+    data["groups"] = sorted(groups)
+    save_manifest(data)
+    print("[expand_manifest] Wrote manifest:", MANIFEST_PATH)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+#!/usr/bin/env python3
+"""
 Manifest expansion script for Algorithmic Gallery V2.
 
 Scans high-value model directories, generates manifest entries with emotional tags,

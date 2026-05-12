@@ -28,22 +28,15 @@ namespace AlgorithmicGallery.Corruption
     {
         // ── Colour palette ────────────────────────────────────────────────────
         private static readonly Color BgDark     = new Color(0.08f, 0.08f, 0.10f);
-        private static readonly Color BgPanel    = new Color(0.12f, 0.12f, 0.15f);
-        private static readonly Color BgButton   = new Color(0.20f, 0.20f, 0.26f);
+        private static readonly Color BgPanel    = new Color(0.10f, 0.10f, 0.13f);
+        private static readonly Color BgButton   = new Color(0.23f, 0.23f, 0.30f);
         private static readonly Color Accent     = new Color(0.35f, 0.65f, 1.00f);
         private static readonly Color AccentRed  = new Color(1.00f, 0.35f, 0.35f);
         private static readonly Color AccentGreen= new Color(0.35f, 1.00f, 0.55f);
         private static readonly Color TextHi     = Color.white;
-        private static readonly Color TextMed    = new Color(0.80f, 0.80f, 0.85f);
-        private static readonly Color TextLow    = new Color(0.50f, 0.50f, 0.55f);
-
-        // ── All emotional tags in vocabulary ──────────────────────────────────
-        private static readonly string[] EmotionalTagVocab =
-        {
-            "intimate", "nostalgic", "comforting", "domestic", "clinical",
-            "institutional", "bureaucratic", "threatening", "melancholy",
-            "abandoned", "decayed", "liminal", "sacred", "public", "mundane", "personal",
-        };
+        private static readonly Color TextMed    = new Color(0.91f, 0.91f, 0.96f);
+        private static readonly Color TextLow    = new Color(0.78f, 0.78f, 0.84f);
+        private const float UiReadabilityScale = 1.25f;
 
         // ── References ────────────────────────────────────────────────────────
         private CurationManager  _mgr;
@@ -53,6 +46,7 @@ namespace AlgorithmicGallery.Corruption
         private Canvas     _canvas;
         private Text       _propNameText;
         private Text       _propInfoText;
+        private Text       _shaderInfoText;
         private Text       _progressText;
         private Text       _queueSubtitle;
         private RawImage   _viewImage;
@@ -63,9 +57,26 @@ namespace AlgorithmicGallery.Corruption
         private Slider     _scaleSlider;
         private InputField _scaleNumInput;
         private Text       _saveLabel;
+        private InputField _personalTagFilterInput;
+        private InputField _corporateTagFilterInput;
+        private GameObject _personalTagScrollRoot;
+        private GameObject _corporateTagScrollRoot;
+        private Text _personalCollapseLabel;
+        private Text _corporateCollapseLabel;
+        private bool _personalSectionCollapsed;
+        private bool _corporateSectionCollapsed;
 
-        // Checkbox state for emotional tags
-        private readonly Dictionary<string, Toggle> _tagToggles = new();
+        private sealed class TagToggleEntry
+        {
+            public string Tag;
+            public Toggle Toggle;
+        }
+
+        // Checkbox state for taxonomy tag families
+        private readonly Dictionary<string, Toggle> _personalTagToggles = new();
+        private readonly Dictionary<string, Toggle> _corporateTagToggles = new();
+        private readonly List<TagToggleEntry> _personalToggleEntries = new();
+        private readonly List<TagToggleEntry> _corporateToggleEntries = new();
 
         // Track whether we're programmatically setting slider/input to avoid feedback loops
         private bool _suppressScaleSync = false;
@@ -82,7 +93,13 @@ namespace AlgorithmicGallery.Corruption
             BuildCanvas();
 
             _mgr.OnPropChanged  += RefreshAll;
-            _mgr.OnQueueRebuilt += () => { RefreshQueueButtons(); RefreshAll(_mgr.CurrentProp); };
+            _mgr.OnQueueRebuilt += () =>
+            {
+                RefreshQueueButtons();
+                RefreshAll(_mgr.CurrentProp);
+                // Reload the viewport prop so dropdown queue switches show the new selection immediately.
+                _vp.LoadProp(_mgr.CurrentProp);
+            };
             _mgr.OnOverlaySaved += FlashSaved;
 
             RefreshAll(_mgr.CurrentProp);
@@ -179,7 +196,11 @@ namespace AlgorithmicGallery.Corruption
                 ? _groupDropdown.options[_groupDropdown.value].text
                 : null;
 
-            var emotionalTags = _tagToggles
+            var personalTags = _personalTagToggles
+                .Where(kv => kv.Value.isOn)
+                .Select(kv => kv.Key)
+                .ToList();
+            var corporateTags = _corporateTagToggles
                 .Where(kv => kv.Value.isOn)
                 .Select(kv => kv.Key)
                 .ToList();
@@ -193,10 +214,17 @@ namespace AlgorithmicGallery.Corruption
                                    .Select(s => s.Trim().ToLower())
                                    .Where(s => s.Length > 0)
                                    .ToList();
+            ctList = ctList.Where(t => !t.StartsWith("corp:", StringComparison.Ordinal)).ToList();
+            foreach (var corp in corporateTags)
+            {
+                string marker = $"corp:{corp}";
+                if (!ctList.Contains(marker))
+                    ctList.Add(marker);
+            }
 
             string notes = _notesInput?.text ?? "";
 
-            _mgr.ApplyOverride(group, emotionalTags, scaleOverride, ctList, notes);
+            _mgr.ApplyOverride(group, personalTags, corporateTags, scaleOverride, ctList, notes);
         }
 
         private void NudgeScale(float delta)
@@ -233,7 +261,7 @@ namespace AlgorithmicGallery.Corruption
                 : "dims unknown";
 
             string scaledStr = prop.LongestAxis > 0.001f
-                ? $"  →  {PropScaler.ScaledLongestAxis(prop):F2} m scaled"
+                ? $"  →  {PropScaler.ScaledLongestAxis(prop, _vp != null ? _vp.GlobalPlacedScaleMultiplier : 1f):F2} m scaled"
                 : "";
 
             if (_propInfoText != null)
@@ -242,6 +270,9 @@ namespace AlgorithmicGallery.Corruption
                     $"group: {prop.Group}  |  {prop.SizeCategory}\n" +
                     $"conf: {prop.Confidence:F3}  |  verts: {prop.VertexCount:N0}\n" +
                     $"{dimStr}{scaledStr}";
+
+            if (_shaderInfoText != null)
+                _shaderInfoText.text = _vp != null ? _vp.CurrentShaderSummary : "shaders: unavailable";
         }
 
         private void RefreshEditPanel(PropEntry prop)
@@ -258,10 +289,17 @@ namespace AlgorithmicGallery.Corruption
                 if (idx >= 0) _groupDropdown.value = idx;
             }
 
-            // Emotional tags
-            foreach (var kv in _tagToggles)
-                kv.Value.isOn = prop.EmotionalTags != null &&
-                                prop.EmotionalTags.Contains(kv.Key);
+            // Personal tags
+            var personal = prop.PersonalTags != null && prop.PersonalTags.Count > 0
+                ? prop.PersonalTags
+                : prop.EmotionalTags;
+            foreach (var kv in _personalTagToggles)
+                kv.Value.isOn = personal != null && personal.Contains(kv.Key);
+
+            // Corporate tags
+            foreach (var kv in _corporateTagToggles)
+                kv.Value.isOn = prop.CorporateTags != null && prop.CorporateTags.Contains(kv.Key);
+            RefreshTagFilters();
 
             // Scale
             float autoScale = PropScaler.ComputeScaleFactor(prop);
@@ -295,12 +333,21 @@ namespace AlgorithmicGallery.Corruption
 
         private void RefreshQueueButtons()
         {
-            // Subtitle shows current queue + filter
             if (_queueSubtitle != null)
             {
-                string label = _mgr.ActiveQueue == CurationQueue.ByGroup && !string.IsNullOrEmpty(_mgr.FilterGroup)
-                    ? $"By Group: {_mgr.FilterGroup}"
-                    : _mgr.ActiveQueue.ToString();
+                string label;
+                switch (_mgr.ActiveQueue)
+                {
+                    case CurationQueue.ByTag when !string.IsNullOrEmpty(_mgr.FilterTag):
+                        label = $"By Tag: {_mgr.FilterTag}";
+                        break;
+                    case CurationQueue.ByGroup when !string.IsNullOrEmpty(_mgr.FilterGroup):
+                        label = $"By Group: {_mgr.FilterGroup}";
+                        break;
+                    default:
+                        label = _mgr.ActiveQueue.ToString();
+                        break;
+                }
                 _queueSubtitle.text = $"Queue: {label}";
             }
         }
@@ -330,8 +377,10 @@ namespace AlgorithmicGallery.Corruption
             _canvas = canvasGo.AddComponent<Canvas>();
             _canvas.renderMode = RenderMode.ScreenSpaceOverlay;
             _canvas.sortingOrder = 100;
-            canvasGo.AddComponent<CanvasScaler>().uiScaleMode = CanvasScaler.ScaleMode.ScaleWithScreenSize;
-            canvasGo.GetComponent<CanvasScaler>().referenceResolution = new Vector2(1920, 1080);
+            var scaler = canvasGo.AddComponent<CanvasScaler>();
+            scaler.uiScaleMode = CanvasScaler.ScaleMode.ScaleWithScreenSize;
+            scaler.referenceResolution = new Vector2(1600, 900);
+            scaler.matchWidthOrHeight = 0.65f;
             canvasGo.AddComponent<GraphicRaycaster>();
 
             if (FindFirstObjectByType<EventSystem>() == null)
@@ -391,20 +440,22 @@ namespace AlgorithmicGallery.Corruption
             MakeQueueButton(parent, CurationQueue.LowConf,    $"Low Conf   ({counts[CurationQueue.LowConf]})",   ref y);
             MakeQueueButton(parent, CurationQueue.Unreviewed, $"Unreviewed ({counts[CurationQueue.Unreviewed]})",ref y);
             MakeQueueButton(parent, CurationQueue.All,        $"All        ({counts[CurationQueue.All]})",       ref y);
+            MakeQueueButton(parent, CurationQueue.Untagged,   $"Untagged   ({counts[CurationQueue.Untagged]})", ref y);
             MakeQueueButton(parent, CurationQueue.Removed,    $"Removed    ({counts[CurationQueue.Removed]})",  ref y);
 
             y -= 12;
-            MakeLabel(parent, "ByGroupLabel", "BY GROUP", 13, TextMed, Vector2.zero, new Vector2(240, 24), ref y);
+            MakeLabel(parent, "ByTagLabel", "BY TAG", 13, TextMed, Vector2.zero, new Vector2(240, 24), ref y);
             y -= 4;
 
-            // Group filter dropdown
-            var groupNames = _mgr.GetGroupBreakdown().Select(t => $"{t.group} ({t.count})").ToList();
-            var dd = MakeDropdown(parent, "GroupFilterDD", groupNames, 240, ref y,
+            // Tag filter dropdown — exposes the unified tag space (taxonomy + group + custom),
+            // including taxonomy tags with zero current matches so the curator sees the full set.
+            var tagBreakdown = _mgr.GetTagBreakdown().ToList();
+            var tagLabels = tagBreakdown.Select(t => $"{t.tag} ({t.count})").ToList();
+            var dd = MakeDropdown(parent, "TagFilterDD", tagLabels, 240, ref y,
                 val =>
                 {
-                    var name = _mgr.GetGroupBreakdown().Select(t => t.group).ToList();
-                    if (val >= 0 && val < name.Count)
-                        _mgr.SetQueue(CurationQueue.ByGroup, name[val]);
+                    if (val >= 0 && val < tagBreakdown.Count)
+                        _mgr.SetQueue(CurationQueue.ByTag, tagBreakdown[val].tag);
                 });
             y -= 4;
 
@@ -440,8 +491,8 @@ namespace AlgorithmicGallery.Corruption
             var btn = MakeButton(parent, $"QBtn_{queue}", label, 240, 28, ref y,
                 () =>
                 {
-                    if (queue == CurationQueue.ByGroup)
-                        return; // handled by dropdown
+                    if (queue == CurationQueue.ByGroup || queue == CurationQueue.ByTag)
+                        return; // handled by their dropdowns
                     _mgr.SetQueue(queue);
                     _vp.LoadProp(_mgr.CurrentProp);
                 });
@@ -497,25 +548,37 @@ namespace AlgorithmicGallery.Corruption
 
             y -= 12;
 
-            // Emotional tags
-            MakeLabel(parent, "ETagsLabel", "Emotional Tags", 11, TextLow, Vector2.zero, new Vector2(316, 18), ref y);
+            // Taxonomy tags
+            MakeLabel(parent, "PersonalTagsLabel", "Personal Tags", 11, TextLow, Vector2.zero, new Vector2(316, 18), ref y);
+            float personalHeaderY = y - 18f;
+            _personalCollapseLabel = CreateInlineHeaderButton(
+                parent, "PersonalCollapseBtn", new Vector2(236, -personalHeaderY), new Vector2(72, 18), "Hide",
+                () =>
+                {
+                    _personalSectionCollapsed = !_personalSectionCollapsed;
+                    if (_personalTagScrollRoot != null) _personalTagScrollRoot.SetActive(!_personalSectionCollapsed);
+                    if (_personalCollapseLabel != null) _personalCollapseLabel.text = _personalSectionCollapsed ? "Show" : "Hide";
+                });
             y -= 2;
+            _personalTagFilterInput = MakeInputField(parent, "PersonalTagsFilter", "filter personal tags...", 316, 22, ref y);
+            _personalTagFilterInput.onValueChanged.AddListener(_ => RefreshTagFilters());
+            _personalTagScrollRoot = BuildTagToggleScroll(parent, "PersonalTagsScroll", TagTaxonomy.PersonalTags, _personalTagToggles, _personalToggleEntries, ref y, 126f);
 
-            // Checkboxes in 2-column grid
-            float checkX = 8;
-            float checkY = y;
-            int col = 0;
-            foreach (var tag in EmotionalTagVocab)
-            {
-                float cx = checkX + col * 158f;
-                var toggle = MakeToggle(parent, $"Tag_{tag}", tag, new Vector2(cx, -checkY), 150);
-                _tagToggles[tag] = toggle;
-                col++;
-                if (col >= 2) { col = 0; checkY += 22; }
-            }
-            // Remaining half-row
-            if (col == 1) checkY += 22;
-            y = checkY + 6;
+            y += 4;
+            MakeLabel(parent, "CorporateTagsLabel", "Corporate Tags", 11, TextLow, Vector2.zero, new Vector2(316, 18), ref y);
+            float corporateHeaderY = y - 18f;
+            _corporateCollapseLabel = CreateInlineHeaderButton(
+                parent, "CorporateCollapseBtn", new Vector2(236, -corporateHeaderY), new Vector2(72, 18), "Hide",
+                () =>
+                {
+                    _corporateSectionCollapsed = !_corporateSectionCollapsed;
+                    if (_corporateTagScrollRoot != null) _corporateTagScrollRoot.SetActive(!_corporateSectionCollapsed);
+                    if (_corporateCollapseLabel != null) _corporateCollapseLabel.text = _corporateSectionCollapsed ? "Show" : "Hide";
+                });
+            y -= 2;
+            _corporateTagFilterInput = MakeInputField(parent, "CorporateTagsFilter", "filter corporate tags...", 316, 22, ref y);
+            _corporateTagFilterInput.onValueChanged.AddListener(_ => RefreshTagFilters());
+            _corporateTagScrollRoot = BuildTagToggleScroll(parent, "CorporateTagsScroll", TagTaxonomy.CorporateTags, _corporateTagToggles, _corporateToggleEntries, ref y, 84f);
 
             // Scale
             MakeLabel(parent, "ScaleLabel", "Scale Override  (0 = auto)", 11, TextLow, Vector2.zero, new Vector2(316, 18), ref y);
@@ -605,6 +668,112 @@ namespace AlgorithmicGallery.Corruption
             _saveLabel = saveGo.GetComponentInChildren<Text>();
         }
 
+        private GameObject BuildTagToggleScroll(
+            Transform parent,
+            string name,
+            IReadOnlyList<string> tags,
+            Dictionary<string, Toggle> targetMap,
+            List<TagToggleEntry> toggleEntries,
+            ref float y,
+            float height)
+        {
+            var scrollRoot = new GameObject(name);
+            var rootRt = scrollRoot.AddComponent<RectTransform>();
+            scrollRoot.transform.SetParent(parent, false);
+            rootRt.anchorMin = rootRt.anchorMax = new Vector2(0, 1);
+            rootRt.pivot = new Vector2(0, 1);
+            rootRt.anchoredPosition = new Vector2(8, -y);
+            rootRt.sizeDelta = new Vector2(300, height);
+            scrollRoot.AddComponent<Image>().color = BgButton;
+
+            var viewport = new GameObject("Viewport");
+            var viewportRt = viewport.AddComponent<RectTransform>();
+            viewport.transform.SetParent(scrollRoot.transform, false);
+            viewportRt.anchorMin = Vector2.zero;
+            viewportRt.anchorMax = Vector2.one;
+            viewportRt.offsetMin = new Vector2(4, 4);
+            viewportRt.offsetMax = new Vector2(-4, -4);
+            viewport.AddComponent<Image>().color = new Color(0f, 0f, 0f, 0.12f);
+            viewport.AddComponent<Mask>().showMaskGraphic = false;
+
+            var content = new GameObject("Content");
+            var contentRt = content.AddComponent<RectTransform>();
+            content.transform.SetParent(viewport.transform, false);
+            contentRt.anchorMin = new Vector2(0, 1);
+            contentRt.anchorMax = new Vector2(1, 1);
+            contentRt.pivot = new Vector2(0, 1);
+
+            float rowHeight = 22f;
+            int rows = Mathf.CeilToInt((tags.Count <= 0 ? 1 : tags.Count) / 2f);
+            contentRt.sizeDelta = new Vector2(0, rows * rowHeight + 8f);
+            contentRt.anchoredPosition = Vector2.zero;
+
+            targetMap.Clear();
+            toggleEntries.Clear();
+            for (int i = 0; i < tags.Count; i++)
+            {
+                string tag = tags[i];
+                int row = i / 2;
+                int col = i % 2;
+                float cx = 2f + col * 146f;
+                float cy = 2f + row * rowHeight;
+                var toggle = MakeToggle(content.transform, $"Tag_{name}_{tag}", tag, new Vector2(cx, -cy), 142f);
+                targetMap[tag] = toggle;
+                toggleEntries.Add(new TagToggleEntry { Tag = tag, Toggle = toggle });
+            }
+
+            var scroll = scrollRoot.AddComponent<ScrollRect>();
+            scroll.viewport = viewportRt;
+            scroll.content = contentRt;
+            scroll.horizontal = false;
+            scroll.vertical = true;
+            scroll.movementType = ScrollRect.MovementType.Clamped;
+            scroll.scrollSensitivity = 24f;
+
+            y += height + 8f;
+            return scrollRoot;
+        }
+
+        private void RefreshTagFilters()
+        {
+            ApplyTagFilter(_personalToggleEntries, _personalTagFilterInput?.text);
+            ApplyTagFilter(_corporateToggleEntries, _corporateTagFilterInput?.text);
+        }
+
+        private static void ApplyTagFilter(List<TagToggleEntry> entries, string filter)
+        {
+            string q = (filter ?? string.Empty).Trim().ToLowerInvariant();
+            foreach (var entry in entries)
+            {
+                if (entry?.Toggle == null) continue;
+                bool show = string.IsNullOrEmpty(q) || (entry.Tag != null && entry.Tag.IndexOf(q, StringComparison.Ordinal) >= 0);
+                if (entry.Toggle.gameObject.activeSelf != show)
+                    entry.Toggle.gameObject.SetActive(show);
+            }
+        }
+
+        private Text CreateInlineHeaderButton(
+            Transform parent,
+            string name,
+            Vector2 anchoredPos,
+            Vector2 size,
+            string label,
+            Action onClick)
+        {
+            var go = new GameObject(name);
+            go.transform.SetParent(parent, false);
+            var rt = go.AddComponent<RectTransform>();
+            rt.anchorMin = rt.anchorMax = new Vector2(0, 1);
+            rt.pivot = new Vector2(0, 1);
+            rt.anchoredPosition = anchoredPos;
+            rt.sizeDelta = size;
+            var img = go.AddComponent<Image>();
+            img.color = BgButton;
+            var btn = go.AddComponent<Button>();
+            btn.onClick.AddListener(() => onClick?.Invoke());
+            return MakeTextChild(go.transform, label, 10, TextHi);
+        }
+
         // ─────────────────────────────────────────────────────────────────────
         // Viewport info overlay (bottom-left of center)
         // ─────────────────────────────────────────────────────────────────────
@@ -621,11 +790,12 @@ namespace AlgorithmicGallery.Corruption
 
             _propNameText = infoGo.AddComponent<Text>();
             _propNameText.font      = UiFontResolver.GetDefault();
-            _propNameText.fontSize  = 16;
+            _propNameText.fontSize  = ScaledFont(16);
             _propNameText.fontStyle = FontStyle.Bold;
             _propNameText.color     = TextHi;
             _propNameText.text      = "";
             _propNameText.supportRichText = false;
+            AddTextContrast(_propNameText);
 
             var subGo = new GameObject("PropSubInfo");
             var subRt = subGo.AddComponent<RectTransform>();
@@ -638,10 +808,30 @@ namespace AlgorithmicGallery.Corruption
 
             _propInfoText = subGo.AddComponent<Text>();
             _propInfoText.font            = UiFontResolver.GetDefault();
-            _propInfoText.fontSize        = 11;
+            _propInfoText.fontSize        = ScaledFont(12);
             _propInfoText.color           = TextMed;
             _propInfoText.lineSpacing     = 1.2f;
             _propInfoText.supportRichText = false;
+            AddTextContrast(_propInfoText);
+
+            var shaderGo = new GameObject("ShaderInfo");
+            var shaderRt = shaderGo.AddComponent<RectTransform>();
+            shaderGo.transform.SetParent(parent, false);
+            shaderRt.anchorMin = new Vector2(0, 0);
+            shaderRt.anchorMax = new Vector2(0.8f, 0);
+            shaderRt.pivot     = new Vector2(0, 0);
+            shaderRt.anchoredPosition = new Vector2(8, 102);
+            shaderRt.sizeDelta = new Vector2(0, 26);
+            _shaderInfoText = shaderGo.AddComponent<Text>();
+            _shaderInfoText.font = UiFontResolver.GetDefault();
+            _shaderInfoText.fontSize = ScaledFont(11);
+            _shaderInfoText.color = TextHi;
+            _shaderInfoText.alignment = TextAnchor.LowerLeft;
+            _shaderInfoText.horizontalOverflow = HorizontalWrapMode.Wrap;
+            _shaderInfoText.verticalOverflow = VerticalWrapMode.Truncate;
+            _shaderInfoText.text = "shaders: pending";
+            _shaderInfoText.supportRichText = false;
+            AddTextContrast(_shaderInfoText);
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -670,11 +860,12 @@ namespace AlgorithmicGallery.Corruption
             progRt.sizeDelta = new Vector2(200, 40);
             _progressText = progGo.AddComponent<Text>();
             _progressText.font      = UiFontResolver.GetDefault();
-            _progressText.fontSize  = 16;
+            _progressText.fontSize  = ScaledFont(16);
             _progressText.fontStyle = FontStyle.Bold;
             _progressText.alignment = TextAnchor.MiddleCenter;
             _progressText.color     = TextHi;
             _progressText.text      = "";
+            AddTextContrast(_progressText);
 
             // Next button
             var nextGo = new GameObject("NextBtn");
@@ -730,10 +921,11 @@ namespace AlgorithmicGallery.Corruption
             rt.sizeDelta = size;
             var t = go.AddComponent<Text>();
             t.font      = UiFontResolver.GetDefault();
-            t.fontSize  = fontSize;
+            t.fontSize  = ScaledFont(fontSize);
             t.color     = color;
             t.text      = text;
             t.supportRichText = false;
+            AddTextContrast(t);
             y += size.y + 2;
             return t;
         }
@@ -768,10 +960,11 @@ namespace AlgorithmicGallery.Corruption
             arrowRt.sizeDelta = new Vector2(20, 20);
             var arrowTxt = arrow.AddComponent<Text>();
             arrowTxt.font     = UiFontResolver.GetDefault();
-            arrowTxt.fontSize = 12;
+            arrowTxt.fontSize = ScaledFont(12);
             arrowTxt.color    = TextMed;
             arrowTxt.text     = "▾";
             arrowTxt.alignment = TextAnchor.MiddleCenter;
+            AddTextContrast(arrowTxt);
 
             // Template
             var template = new GameObject("Template");
@@ -939,11 +1132,12 @@ namespace AlgorithmicGallery.Corruption
             lblRt.offsetMax = Vector2.zero;
             var lblTxt = lbl.AddComponent<Text>();
             lblTxt.font     = UiFontResolver.GetDefault();
-            lblTxt.fontSize = 11;
+            lblTxt.fontSize = ScaledFont(11);
             lblTxt.color    = TextMed;
             lblTxt.text     = label;
             lblTxt.alignment = TextAnchor.MiddleLeft;
             lblTxt.supportRichText = false;
+            AddTextContrast(lblTxt);
 
             return tog;
         }
@@ -1019,12 +1213,28 @@ namespace AlgorithmicGallery.Corruption
             rt.offsetMax = new Vector2(-4, 0);
             var t = go.AddComponent<Text>();
             t.font      = UiFontResolver.GetDefault();
-            t.fontSize  = fontSize;
+            t.fontSize  = ScaledFont(fontSize);
             t.color     = color;
             t.text      = label;
             t.alignment = TextAnchor.MiddleCenter;
             t.supportRichText = false;
+            AddTextContrast(t);
             return t;
+        }
+
+        private static int ScaledFont(int baseSize)
+        {
+            return Mathf.Max(10, Mathf.RoundToInt(baseSize * UiReadabilityScale));
+        }
+
+        private static void AddTextContrast(Text text)
+        {
+            if (text == null) return;
+            var outline = text.GetComponent<Outline>();
+            if (outline == null)
+                outline = text.gameObject.AddComponent<Outline>();
+            outline.effectColor = new Color(0f, 0f, 0f, 0.95f);
+            outline.effectDistance = new Vector2(1.1f, -1.1f);
         }
     }
 }

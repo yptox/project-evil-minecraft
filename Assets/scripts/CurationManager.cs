@@ -11,8 +11,10 @@ namespace AlgorithmicGallery.Corruption
         Oversized  = 1,
         LowConf    = 2,
         Unreviewed = 3,
-        ByGroup    = 4,
+        ByGroup    = 4,   // legacy: filter by single Group field
         Removed    = 5,
+        ByTag      = 6,   // tag-first filter across unified tag set (group + personal + corporate + custom)
+        Untagged   = 7,   // props with no tag overlap of any kind (cleanup bucket)
     }
 
     // Central state manager for the CurationLab scene.
@@ -30,6 +32,7 @@ namespace AlgorithmicGallery.Corruption
 
         public CurationQueue ActiveQueue { get; private set; } = CurationQueue.Oversized;
         public string        FilterGroup { get; private set; } = "";
+        public string        FilterTag   { get; private set; } = "";
 
         public int  QueueCount    => _queue.Count;
         public int  CurrentIndex  => _cursor;
@@ -52,6 +55,7 @@ namespace AlgorithmicGallery.Corruption
         {
             Manifest = CuratedPropManifest.LoadFromStreamingAssets();
             Overlay  = CurationOverlay.Load();
+            TagTaxonomy.EnsureLoaded();
 
             if (Manifest != null)
                 CurationOverlay.ApplyToManifest(Manifest, Overlay);
@@ -82,10 +86,28 @@ namespace AlgorithmicGallery.Corruption
         }
 
         // ── Queue switching ───────────────────────────────────────────────────
-        public void SetQueue(CurationQueue queue, string groupFilter = "")
+        // For ByGroup: filter is the legacy single-group string (`PropEntry.Group`).
+        // For ByTag:   filter is any tag value drawn from the unified tag space (taxonomy + group + custom).
+        // For all other queues: filter is ignored and both filter strings are cleared.
+        public void SetQueue(CurationQueue queue, string filter = "")
         {
             ActiveQueue = queue;
-            FilterGroup = groupFilter ?? "";
+            string normalized = (filter ?? "").Trim().ToLowerInvariant();
+            switch (queue)
+            {
+                case CurationQueue.ByGroup:
+                    FilterGroup = normalized;
+                    FilterTag = "";
+                    break;
+                case CurationQueue.ByTag:
+                    FilterTag = normalized;
+                    FilterGroup = "";
+                    break;
+                default:
+                    FilterGroup = "";
+                    FilterTag = "";
+                    break;
+            }
             RebuildQueue();
             _cursor = 0;
             OnQueueRebuilt?.Invoke();
@@ -142,10 +164,11 @@ namespace AlgorithmicGallery.Corruption
         // scaleOverride < 0 means "leave unchanged"; 0 means "clear override / use auto".
         public void ApplyOverride(
             string       group         = null,
-            List<string> emotionalTags = null,
+            List<string> personalTags  = null,
+            List<string> corporateTags = null,
             float        scaleOverride = -1f,
-            List<string> customTags   = null,
-            string       notes        = null)
+            List<string> customTags    = null,
+            string       notes         = null)
         {
             var prop = CurrentProp;
             if (prop == null) return;
@@ -157,10 +180,23 @@ namespace AlgorithmicGallery.Corruption
                 entry.Group = group;
                 prop.Group  = group;
             }
-            if (emotionalTags != null)
+            if (personalTags != null)
             {
-                entry.EmotionalTags = new List<string>(emotionalTags);
-                prop.EmotionalTags  = new List<string>(emotionalTags);
+                var normalizedPersonal = TagTaxonomy.NormalizePersonal(personalTags, out var droppedPersonal);
+                entry.EmotionalTags = new List<string>(normalizedPersonal);
+                entry.PersonalTags = new List<string>(normalizedPersonal);
+                prop.EmotionalTags  = new List<string>(normalizedPersonal);
+                prop.PersonalTags  = new List<string>(normalizedPersonal);
+                if (droppedPersonal.Count > 0)
+                    Debug.LogWarning($"[CurationManager] Dropped invalid personal tags for '{prop.Id}': {string.Join(", ", droppedPersonal)}");
+            }
+            if (corporateTags != null)
+            {
+                var normalizedCorporate = TagTaxonomy.NormalizeCorporate(corporateTags, out var droppedCorporate);
+                entry.CorporateTags = new List<string>(normalizedCorporate);
+                prop.CorporateTags = new List<string>(normalizedCorporate);
+                if (droppedCorporate.Count > 0)
+                    Debug.LogWarning($"[CurationManager] Dropped invalid corporate tags for '{prop.Id}': {string.Join(", ", droppedCorporate)}");
             }
             if (scaleOverride >= 0f)
             {
@@ -201,7 +237,121 @@ namespace AlgorithmicGallery.Corruption
         {
             var builtIn = new[] { "item", "furniture", "lab", "office",
                                   "workshop", "domestic", "retail", "tech" };
-            return builtIn.Concat(Overlay.CustomGroups).Distinct().OrderBy(g => g);
+            var manifestGroups = Manifest?.All
+                ?.Select(p => p?.Group)
+                .Where(g => !string.IsNullOrWhiteSpace(g))
+                .Select(g => g.Trim().ToLowerInvariant())
+                ?? Enumerable.Empty<string>();
+
+            var custom = (Overlay?.CustomGroups ?? new List<string>())
+                .Where(g => !string.IsNullOrWhiteSpace(g))
+                .Select(g => g.Trim().ToLowerInvariant());
+
+            return builtIn
+                .Concat(manifestGroups)
+                .Concat(custom)
+                .Distinct(StringComparer.Ordinal)
+                .OrderBy(g => g, StringComparer.Ordinal);
+        }
+
+        // ── Unified tag space ─────────────────────────────────────────────────
+        // Returns the unified tag set for a prop: group + personal + corporate +
+        // custom (with `corp:` prefix stripped) + emotional + freeform tags.
+        // Empty/whitespace tags are dropped, casing is normalized.
+        public static IEnumerable<string> GetUnifiedTagsForProp(PropEntry p)
+        {
+            if (p == null) yield break;
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+
+            string Norm(string s) => (s ?? "").Trim().ToLowerInvariant();
+
+            string g = Norm(p.Group);
+            if (g.Length > 0 && seen.Add(g)) yield return g;
+
+            if (p.PersonalTags != null)
+                foreach (var t in p.PersonalTags) { var n = Norm(t); if (n.Length > 0 && seen.Add(n)) yield return n; }
+            if (p.EmotionalTags != null)
+                foreach (var t in p.EmotionalTags) { var n = Norm(t); if (n.Length > 0 && seen.Add(n)) yield return n; }
+            if (p.CorporateTags != null)
+                foreach (var t in p.CorporateTags) { var n = Norm(t); if (n.Length > 0 && seen.Add(n)) yield return n; }
+            if (p.CustomTags != null)
+                foreach (var raw in p.CustomTags)
+                {
+                    var n = Norm(raw);
+                    if (n.StartsWith("corp:", StringComparison.Ordinal)) n = n.Substring(5);
+                    if (n.Length > 0 && seen.Add(n)) yield return n;
+                }
+            if (p.Tags != null)
+                foreach (var t in p.Tags) { var n = Norm(t); if (n.Length > 0 && seen.Add(n)) yield return n; }
+        }
+
+        // Convenience: hashed lookup of unified tags for a prop.
+        public static HashSet<string> GetUnifiedTagSetForProp(PropEntry p)
+            => new HashSet<string>(GetUnifiedTagsForProp(p), StringComparer.Ordinal);
+
+        // Returns true when a prop has zero unified tags.
+        public static bool IsPropUntagged(PropEntry p)
+        {
+            using (var e = GetUnifiedTagsForProp(p).GetEnumerator())
+                return !e.MoveNext();
+        }
+
+        // Universe of tags presented to the curator: taxonomy (always shown,
+        // even at zero count) + every tag actually used in the manifest +
+        // overlay custom groups. Sorted alphabetically.
+        public IEnumerable<string> AllTags()
+        {
+            TagTaxonomy.EnsureLoaded();
+            var taxonomy = (TagTaxonomy.PersonalTags ?? new List<string>())
+                .Concat(TagTaxonomy.CorporateTags ?? new List<string>());
+
+            var manifestTags = Manifest?.All
+                ?.Where(p => p != null)
+                .SelectMany(p => GetUnifiedTagsForProp(p))
+                ?? Enumerable.Empty<string>();
+
+            var customs = (Overlay?.CustomGroups ?? new List<string>())
+                .Where(g => !string.IsNullOrWhiteSpace(g))
+                .Select(g => g.Trim().ToLowerInvariant());
+
+            return taxonomy
+                .Concat(manifestTags)
+                .Concat(customs)
+                .Where(t => !string.IsNullOrWhiteSpace(t))
+                .Distinct(StringComparer.Ordinal)
+                .OrderBy(t => t, StringComparer.Ordinal);
+        }
+
+        // Returns count of active (non-removed) props per tag.
+        // Includes every taxonomy tag even when count is zero, so the curator
+        // sees the full filterable set rather than only tags that already exist.
+        public IEnumerable<(string tag, int count)> GetTagBreakdown()
+        {
+            if (Manifest == null) yield break;
+            var active = Manifest.All.Where(p => !Overlay.RemovedIds.Contains(p.Id)).ToList();
+            var counts = new Dictionary<string, int>(StringComparer.Ordinal);
+
+            foreach (var p in active)
+            {
+                foreach (var tag in GetUnifiedTagsForProp(p))
+                {
+                    counts[tag] = counts.TryGetValue(tag, out var c) ? c + 1 : 1;
+                }
+            }
+
+            // Fold in the full known tag universe so zero-count tags still surface.
+            foreach (var t in AllTags())
+            {
+                if (!counts.ContainsKey(t))
+                    counts[t] = 0;
+            }
+
+            foreach (var kv in counts
+                .OrderByDescending(kv => kv.Value)
+                .ThenBy(kv => kv.Key, StringComparer.Ordinal))
+            {
+                yield return (kv.Key, kv.Value);
+            }
         }
 
         // ── Stats for UI ──────────────────────────────────────────────────────
@@ -222,6 +372,9 @@ namespace AlgorithmicGallery.Corruption
                 [CurationQueue.Unreviewed] = active.Count(p => !reviewed.Contains(p.Id)),
                 [CurationQueue.ByGroup]    = string.IsNullOrEmpty(FilterGroup) ? 0
                     : active.Count(p => p.Group == FilterGroup),
+                [CurationQueue.ByTag]      = string.IsNullOrEmpty(FilterTag) ? 0
+                    : active.Count(p => GetUnifiedTagSetForProp(p).Contains(FilterTag)),
+                [CurationQueue.Untagged]   = active.Count(IsPropUntagged),
                 [CurationQueue.Removed]    = removed.Count,
             };
         }
@@ -239,6 +392,13 @@ namespace AlgorithmicGallery.Corruption
         public void SaveOverlay()
         {
             CurationOverlay.Save(Overlay);
+            Manifest?.SaveToStreamingAssets(Overlay.RemovedIds);
+            if (Manifest != null)
+            {
+                int withPersonal = Manifest.All.Count(p => p.PersonalTags != null && p.PersonalTags.Count > 0);
+                int withCorporate = Manifest.All.Count(p => p.CorporateTags != null && p.CorporateTags.Count > 0);
+                Debug.Log($"[CurationManager] Saved overlay + manifest. personal_tags={withPersonal}/{Manifest.All.Count} corporate_tags={withCorporate}/{Manifest.All.Count}");
+            }
             OnOverlaySaved?.Invoke();
         }
 
@@ -266,6 +426,15 @@ namespace AlgorithmicGallery.Corruption
                 case CurationQueue.ByGroup:
                     if (!string.IsNullOrEmpty(FilterGroup))
                         source = source.Where(p => p.Group == FilterGroup);
+                    break;
+                case CurationQueue.ByTag:
+                    if (string.IsNullOrEmpty(FilterTag))
+                        source = Enumerable.Empty<PropEntry>();
+                    else
+                        source = source.Where(p => GetUnifiedTagSetForProp(p).Contains(FilterTag));
+                    break;
+                case CurationQueue.Untagged:
+                    source = source.Where(IsPropUntagged);
                     break;
                 case CurationQueue.Removed:
                     source = Manifest.All.Where(p => Overlay.RemovedIds.Contains(p.Id));

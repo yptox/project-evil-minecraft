@@ -1,4 +1,7 @@
 using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
 using UnityEngine;
 using UnityEngine.Events;
 
@@ -17,6 +20,12 @@ namespace AlgorithmicGallery.Corruption
         [SerializeField] private Transform _sandboxFloorRoot;
         [SerializeField] private Collider _sandboxEnterTrigger;
 
+        [Header("Curated manifest")]
+        [Tooltip("If true, loads curated-props.game-ready.json when present (reviewed & not removed); otherwise falls back.")]
+        [SerializeField] private bool _preferGameReadyManifest = true;
+        [SerializeField] private string _gameReadyManifestFileName = "curated-props.game-ready.json";
+        [SerializeField] private string _fallbackManifestFileName = CuratedPropManifest.DefaultManifestFileName;
+
         [Header("Auto-bootstrap")]
         [Tooltip("If true, missing dependencies are created at Start.")]
         [SerializeField] private bool _autoBootstrap = true;
@@ -24,11 +33,11 @@ namespace AlgorithmicGallery.Corruption
         [SerializeField] private bool _startSandboxImmediately = true;
         [SerializeField] private Vector2 _defaultFloorSize = new Vector2(10f, 10f);
 
-        [Header("Session")]
-        [SerializeField] private float _sessionDuration = 120f;
+        [Header("Session (placement cap)")]
+        [Tooltip("Sandbox ends when total placements (player + assistant) reach this count.")]
+        [SerializeField] private int _maxTotalPlacements = 25;
         [SerializeField] private float _endGracePeriod = 0f;
-        [Tooltip("If true, session timer starts when the player places their first prop.")]
-        [SerializeField] private bool _startTimerOnFirstPlayerPlacement = true;
+        [SerializeField] private float _hotbarFadeOutDuration = 0.35f;
         [SerializeField] private CanvasGroup _endFadeCanvasGroup;
         [SerializeField] private float _fadeDuration = 3f;
 
@@ -50,14 +59,59 @@ namespace AlgorithmicGallery.Corruption
         public PropPlacer Placer => _propPlacer;
         public Transform SandboxFloor => _sandboxFloorRoot;
 
+        /// <summary>Three UI labels for the session score bars: two personal dimensions + corporate target.</summary>
+        public string[] ScoringBarLabels => _scoringBarLabels ?? FallbackScoringBarLabels;
+
+        /// <summary>Emotional slugs for bars 0–1 (for placement score routing).</summary>
+        public string ScoringPersonalSlug0 => _scoringPersonalSlug0 ?? "personal";
+        public string ScoringPersonalSlug1 => _scoringPersonalSlug1 ?? "nostalgic";
+        /// <summary>Corporate taxonomy slug for bar 2 (matches <see cref="PromptDefinition.CorporateTargetTag"/>).</summary>
+        public string ScoringCorporateSlug => _scoringCorporateSlug ?? "marketable";
+
+        // Personal-dimension tags — kept for compatibility; now mirrors <see cref="ScoringBarLabels"/> (three entries).
+        private string[] _personalDimensionTags;
+        private string[] _scoringBarLabels;
+        private string _scoringPersonalSlug0;
+        private string _scoringPersonalSlug1;
+        private string _scoringCorporateSlug;
+
+        private static readonly string[] FallbackScoringBarLabels = { "Personal", "Nostalgic", "Marketable" };
+
+        public string[] PersonalDimensionTags
+        {
+            get
+            {
+                if (_personalDimensionTags != null && _personalDimensionTags.Length > 0)
+                    return _personalDimensionTags;
+
+                if (_scoringBarLabels != null && _scoringBarLabels.Length > 0)
+                    return _scoringBarLabels;
+
+                if (StyleProfile != null)
+                {
+                    var emotional = StyleProfile.DominantEmotionalTags(3);
+                    if (emotional != null && emotional.Count > 0)
+                        return emotional.ToArray();
+
+                    var generic = StyleProfile.DominantTags(3);
+                    if (generic != null && generic.Count > 0)
+                        return generic.ToArray();
+                }
+
+                return FallbackPersonalDimensionTags;
+            }
+        }
+
+        private static readonly string[] FallbackPersonalDimensionTags = { "personal", "nostalgic", "intimate" };
+
         private ThemeSelectionUI _themeSelectionUI;
-        private bool _sessionTimerStarted;
+        private bool _sessionCompletionStarted;
         private Coroutine _commitRoutine;
 
         void Start()
         {
             StyleProfile = new StyleProfile();
-            Manifest = CuratedPropManifest.LoadFromStreamingAssets();
+            Manifest = LoadCuratedManifestForSandbox();
 
             if (Manifest == null)
             {
@@ -75,7 +129,10 @@ namespace AlgorithmicGallery.Corruption
                 _hotbarController.Initialize(Manifest, StyleProfile);
 
             if (_propPlacer != null)
+            {
                 _propPlacer.Initialize(_hotbarController, StyleProfile, this);
+                _propPlacer.OnPropPlacedWithContext += HandlePlacementScoreWithContext;
+            }
 
             if (_assistantSystem != null)
                 _assistantSystem.Initialize(_propPlacer, _hotbarController, StyleProfile, Manifest, _sandboxFloorRoot);
@@ -85,6 +142,39 @@ namespace AlgorithmicGallery.Corruption
 
             if (_sandboxEnterTrigger == null && _startSandboxImmediately)
                 BeginSandbox();
+        }
+
+        /// <summary>
+        /// Sandbox gameplay uses the split game-ready manifest when enabled and the file exists.
+        /// </summary>
+        private CuratedPropManifest LoadCuratedManifestForSandbox()
+        {
+            if (_preferGameReadyManifest &&
+                !string.IsNullOrWhiteSpace(_gameReadyManifestFileName))
+            {
+                string grPath = CuratedPropManifest.ManifestPath(_gameReadyManifestFileName);
+                if (File.Exists(grPath))
+                {
+                    var gameReady = CuratedPropManifest.LoadFromStreamingAssets(_gameReadyManifestFileName);
+                    if (gameReady != null && gameReady.Count > 0)
+                    {
+                        Debug.Log($"[SandboxManager] Using game-ready manifest ({_gameReadyManifestFileName}), count={gameReady.Count}.");
+                        return gameReady;
+                    }
+
+                    Debug.LogWarning(
+                        $"[SandboxManager] Game-ready manifest empty or failed to parse: {_gameReadyManifestFileName}. " +
+                        $"Falling back to {_fallbackManifestFileName}.");
+                }
+                else
+                {
+                    Debug.LogWarning(
+                        $"[SandboxManager] Game-ready manifest not found at {grPath}. " +
+                        $"Run tools/split_game_ready_manifest.py. Using {_fallbackManifestFileName}.");
+                }
+            }
+
+            return CuratedPropManifest.LoadFromStreamingAssets(_fallbackManifestFileName);
         }
 
         private void BootstrapMissingDependencies()
@@ -194,12 +284,30 @@ namespace AlgorithmicGallery.Corruption
                 se.AddComponent<SessionExporter>();
             }
 
-            // End card
-            if (FindFirstObjectByType<EndCard>() == null)
+            // (EndCard intentionally not bootstrapped — session end uses rig freeze + hotbar hide
+            // and the diorama loop reload instead of a black overlay screen.)
+
+            // Scoring wall — scene-placed only. Warn if missing so the wall's absence is visible.
+            if (FindFirstObjectByType<ScoringWallController>() == null)
+                Debug.LogWarning("[SandboxManager] ScoringWallController not found in scene. Scoring wall will not appear.");
+
+            // Title screen — auto-create if not scene-placed so the loop always starts behind a Begin gate.
+            if (FindFirstObjectByType<TitleScreenUI>() == null)
             {
-                var ec = new GameObject("EndCard");
-                ec.transform.SetParent(transform);
-                ec.AddComponent<EndCard>();
+                var ts = new GameObject("TitleScreenUI");
+                ts.transform.SetParent(transform);
+                ts.AddComponent<TitleScreenUI>();
+                Debug.Log("[SandboxManager] Auto-created TitleScreenUI");
+            }
+
+            // HallwayManager safety-net — required for live pedestal refresh on session end.
+            // Alyssa can override by placing one in the scene with explicit anchors.
+            if (FindFirstObjectByType<HallwayManager>() == null)
+            {
+                var hmGO = new GameObject("HallwayManager");
+                hmGO.transform.SetParent(transform);
+                hmGO.AddComponent<HallwayManager>();
+                Debug.Log("[SandboxManager] Auto-created HallwayManager (no scene-placed instance found)");
             }
 
             // Thumbnail capture (singleton)
@@ -288,11 +396,143 @@ namespace AlgorithmicGallery.Corruption
             }
         }
 
+        void OnDestroy()
+        {
+            if (_themeSelectionUI != null)
+                _themeSelectionUI.OnPromptSelected -= OnPromptSelected;
+            if (_propPlacer != null)
+                _propPlacer.OnPropPlacedWithContext -= HandlePlacementScoreWithContext;
+        }
+
         private void OnPromptSelected(PromptDefinition prompt)
         {
             if (_commitRoutine != null)
                 StopCoroutine(_commitRoutine);
             _commitRoutine = StartCoroutine(CommitPromptFlow(prompt));
+        }
+
+        private void ApplyScoringSessionToPrompt(PromptDefinition prompt)
+        {
+            if (prompt == null) return;
+            PromptScoringHelper.EnsureCorporateTarget(prompt);
+            _scoringBarLabels = PromptScoringHelper.BuildThreeFlattenLabels(prompt);
+            var slugs = PromptScoringHelper.PersonalSlugsForScoring(prompt);
+            _scoringPersonalSlug0 = slugs.slug0;
+            _scoringPersonalSlug1 = slugs.slug1;
+            _scoringCorporateSlug = string.IsNullOrWhiteSpace(prompt.CorporateTargetTag)
+                ? "marketable"
+                : prompt.CorporateTargetTag.Trim().ToLowerInvariant();
+            _personalDimensionTags = _scoringBarLabels;
+
+            var wall = FindFirstObjectByType<ScoringWallController>();
+            if (wall != null)
+                wall.ConfigureSession(_scoringBarLabels, 1500f);
+        }
+
+        private void HandlePlacementScoreWithContext(bool isPlayer, PropEntry prop, Vector3 worldPosition)
+        {
+            if (!SandboxActive || prop == null) return;
+
+            var wall = FindFirstObjectByType<ScoringWallController>();
+            var scoreEvents = BuildScoreEventsForPlacement(isPlayer, prop);
+            if (scoreEvents.Count == 0)
+                return;
+
+            for (int i = 0; i < scoreEvents.Count; i++)
+            {
+                var evt = scoreEvents[i];
+                wall?.AddScoreToBar(evt.barIndex, evt.amount);
+                PlacementScoreFloater.Spawn(
+                    worldPosition,
+                    evt.amount,
+                    evt.label,
+                    useCorporateBlue: evt.barIndex == 2,
+                    worldOffset: BuildFloaterOffset(i, scoreEvents.Count));
+            }
+        }
+
+        private List<(int barIndex, int amount, string label)> BuildScoreEventsForPlacement(bool isPlayer, PropEntry prop)
+        {
+            var events = new List<(int barIndex, int amount, string label)>();
+            var labels = ScoringBarLabels;
+
+            if (!isPlayer)
+            {
+                // System placements still only score the corporate column.
+                string corp = (labels != null && labels.Length > 2 && !string.IsNullOrWhiteSpace(labels[2]))
+                    ? labels[2].Trim()
+                    : PromptScoringHelper.CorporateBarDisplayLabel(SelectedPrompt);
+                events.Add((2, UnityEngine.Random.Range(50, 101), corp));
+                return events;
+            }
+
+            var matchedBars = ResolveMatchingPlayerBars(prop);
+            if (matchedBars.Count == 0)
+                matchedBars.Add(ResolveScoreBarIndex(prop));
+
+            for (int i = 0; i < matchedBars.Count; i++)
+            {
+                int bar = matchedBars[i];
+                string label = (bar >= 0 && bar < labels.Length) ? labels[bar] : "Score";
+                events.Add((bar, UnityEngine.Random.Range(50, 101), label));
+            }
+
+            return events;
+        }
+
+        private List<int> ResolveMatchingPlayerBars(PropEntry prop)
+        {
+            var bars = new List<int>(3);
+            if (ScorePersonalMatch(prop, ScoringPersonalSlug0) > 0f)
+                bars.Add(0);
+            if (ScorePersonalMatch(prop, ScoringPersonalSlug1) > 0f)
+                bars.Add(1);
+            if (ScoreCorporateMatch(prop, ScoringCorporateSlug) > 0f)
+                bars.Add(2);
+            return bars;
+        }
+
+        private static Vector3 BuildFloaterOffset(int index, int total)
+        {
+            if (total <= 1) return Vector3.zero;
+
+            const float radius = 0.14f;
+            const float yStep = 0.03f;
+            float step = (Mathf.PI * 2f) / total;
+            float angle = step * index;
+            return new Vector3(Mathf.Cos(angle) * radius, index * yStep, Mathf.Sin(angle) * radius);
+        }
+
+        private int ResolveScoreBarIndex(PropEntry prop)
+        {
+            float w0 = ScorePersonalMatch(prop, ScoringPersonalSlug0) + 0.12f;
+            float w1 = ScorePersonalMatch(prop, ScoringPersonalSlug1) + 0.12f;
+            float w2 = ScoreCorporateMatch(prop, ScoringCorporateSlug) + 0.38f;
+            float t = w0 + w1 + w2;
+            float r = UnityEngine.Random.value * t;
+            if (r < w0) return 0;
+            r -= w0;
+            if (r < w1) return 1;
+            return 2;
+        }
+
+        private static float ScorePersonalMatch(PropEntry p, string slug)
+        {
+            if (p == null || string.IsNullOrWhiteSpace(slug)) return 0f;
+            int n = 0;
+            if (p.EmotionalTags != null)
+                n += p.EmotionalTags.Count(t => string.Equals(t, slug, System.StringComparison.OrdinalIgnoreCase));
+            if (p.PersonalTags != null)
+                n += p.PersonalTags.Count(t => string.Equals(t, slug, System.StringComparison.OrdinalIgnoreCase));
+            return Mathf.Min(5, n) * 0.85f;
+        }
+
+        private static float ScoreCorporateMatch(PropEntry p, string slug)
+        {
+            if (p?.CorporateTags == null || string.IsNullOrWhiteSpace(slug)) return 0f;
+            return p.CorporateTags.Any(c => string.Equals(c, slug, System.StringComparison.OrdinalIgnoreCase))
+                ? 2.4f
+                : 0f;
         }
 
         private IEnumerator CommitPromptFlow(PromptDefinition prompt)
@@ -301,6 +541,7 @@ namespace AlgorithmicGallery.Corruption
             Debug.Log($"[SandboxManager] Prompt selected: \"{prompt.DisplayText}\"");
             OpeningState = PromptState.SquishingText;
             OnPromptSquishStarted?.Invoke();
+            GameplayEventDebugLog.Push("Sandbox", "OnPromptSquishStarted");
 
             // Terminal/UI squish and reduction readout beat.
             yield return new WaitForSecondsRealtime(0.95f);
@@ -308,14 +549,17 @@ namespace AlgorithmicGallery.Corruption
             OpeningState = PromptState.InterpretingPrompt;
             yield return new WaitForSecondsRealtime(0.6f);
 
+            ApplyScoringSessionToPrompt(prompt);
             _hotbarController?.SetActivePrompt(prompt);
             _assistantSystem?.SetActivePrompt(prompt);
             OpeningState = PromptState.PromptCommitted;
             OnPromptCommitted?.Invoke();
+            GameplayEventDebugLog.Push("Sandbox", "OnPromptCommitted");
 
             HallwayUnlocked = true;
             OpeningState = PromptState.HallwayUnlocked;
             OnHallwayUnlocked?.Invoke();
+            GameplayEventDebugLog.Push("Sandbox", "OnHallwayUnlocked");
 
             if (_startSandboxImmediately)
                 ActivateSandbox();
@@ -343,6 +587,7 @@ namespace AlgorithmicGallery.Corruption
             if (SandboxActive) return;
             SandboxActive = true;
             OpeningState = PromptState.SandboxActive;
+            _sessionCompletionStarted = false;
 
             if (_propPlacer != null)
                 _propPlacer.PlacementEnabled = true;
@@ -351,13 +596,16 @@ namespace AlgorithmicGallery.Corruption
                 _assistantSystem.StartSession();
 
             OnSandboxEntered?.Invoke();
+            GameplayEventDebugLog.Push("Sandbox", "OnSandboxEntered");
             Debug.Log("[SandboxManager] Sandbox session begun.");
+        }
 
-            if (!_startTimerOnFirstPlayerPlacement)
-            {
-                _sessionTimerStarted = true;
-                StartCoroutine(SessionTimer());
-            }
+        /// <summary>Remaining placements until the session completes (player + assistant).</summary>
+        public int GetPlacementsLeft()
+        {
+            if (StyleProfile == null)
+                return Mathf.Max(0, _maxTotalPlacements);
+            return Mathf.Max(0, _maxTotalPlacements - StyleProfile.PlacementCount);
         }
 
         // Called by PropPlacer after the player successfully places a prop.
@@ -365,29 +613,80 @@ namespace AlgorithmicGallery.Corruption
         {
             if (!SandboxActive) return;
             _assistantSystem?.OnPlayerPlaced(worldPos);
-
-            if (_startTimerOnFirstPlayerPlacement && !_sessionTimerStarted)
-            {
-                _sessionTimerStarted = true;
-                StartCoroutine(SessionTimer());
-            }
         }
 
-        private IEnumerator SessionTimer()
+        /// <summary>
+        /// Called after any successful placement is recorded (player or assistant).
+        /// Ends the sandbox when total placements reach <see cref="_maxTotalPlacements"/>.
+        /// </summary>
+        public void NotifyPlacementRecorded()
         {
-            yield return new WaitForSeconds(_sessionDuration);
+            if (_sessionCompletionStarted || !SandboxActive || StyleProfile == null)
+                return;
+            if (StyleProfile.PlacementCount < _maxTotalPlacements)
+                return;
+
+            _sessionCompletionStarted = true;
+            SandboxActive = false;
 
             if (_propPlacer != null)
                 _propPlacer.PlacementEnabled = false;
 
+            _assistantSystem?.StopSession();
+
+            // Fire completion immediately so the hallway door opens the moment placements run out.
+            OnSessionComplete?.Invoke();
+            GameplayEventDebugLog.Push("Sandbox", "OnSessionComplete");
+            Debug.Log("[SandboxManager] Session complete.");
+
+            // Fade hotbar out right away at placement cap.
+            StartCoroutine(FadeOutHotbarUi());
+
+            StartCoroutine(CompleteSessionSequence());
+        }
+
+        private IEnumerator CompleteSessionSequence()
+        {
             yield return new WaitForSeconds(_endGracePeriod);
 
-            _assistantSystem?.StopSession();
-            OnSessionComplete?.Invoke();
-            Debug.Log("[SandboxManager] Session complete.");
+            // Freeze player movement and hide the hotbar for the post-session walkback.
+            // The session-complete listeners (gate open, live pedestal refresh) take it from here.
+            PlayerInputFreeze.FreezePlayerLocomotion();
+
+            // Restore the rig now that gate/diorama listeners have been notified — the player
+            // needs to be able to walk back to the hallway. Hotbar stays hidden.
+            PlayerInputFreeze.RestorePlayerLocomotion();
 
             if (_endFadeCanvasGroup != null)
                 yield return FadeOut();
+        }
+
+        private IEnumerator FadeOutHotbarUi()
+        {
+            var hotbarUI = FindFirstObjectByType<HotbarUI>();
+            if (hotbarUI == null)
+                yield break;
+
+            var hbCg = hotbarUI.GetComponentInChildren<CanvasGroup>(includeInactive: true);
+            if (hbCg == null)
+            {
+                hotbarUI.gameObject.SetActive(false);
+                yield break;
+            }
+
+            hbCg.blocksRaycasts = false;
+            hbCg.interactable = false;
+
+            float startAlpha = hbCg.alpha;
+            float dur = Mathf.Max(0.01f, _hotbarFadeOutDuration);
+            float t = 0f;
+            while (t < dur)
+            {
+                t += Time.deltaTime;
+                hbCg.alpha = Mathf.Lerp(startAlpha, 0f, t / dur);
+                yield return null;
+            }
+            hbCg.alpha = 0f;
         }
 
         private IEnumerator FadeOut()

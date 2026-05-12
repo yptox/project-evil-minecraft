@@ -14,6 +14,8 @@ namespace AlgorithmicGallery.Corruption
         // selection is driven by emotional_tags rather than group alone.
         public string[] EmotionalTags;
         public string[] DriftEmotionalTags;
+        /// <summary>Corporate taxonomy slug chosen for this round (e.g. marketable, engaging). Drives assistant/hotbar and scoring bar 3.</summary>
+        public string CorporateTargetTag;
         // True for memory/feeling prompts — lets the assistant treat style-drift
         // as misreading the player's inner life rather than changing decor style.
         public bool IsAbstract;

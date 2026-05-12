@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "character_keywords": [
+    "character",
+    "npc",
+    "player",
+    "human",
+    "humanoid",
+    "person",
+    "body",
+    "head",
+    "face",
+    "hair",
+    "soldier",
+    "zombie",
+    "girl",
+    "boy"
+  ],
+  "viewmodel_keywords": [
+    "viewmodel",
+    "fp_",
+    "fps_",
+    "weapon",
+    "gun",
+    "rifle",
+    "pistol",
+    "shotgun",
+    "arms",
+    "hands",
+    "firstperson",
+    "1p",
+    "sleeves"
+  ],
+  "large_structure_keywords": [
+    "building",
+    "house",
+    "tower",
+    "skyscraper",
+    "structure",
+    "castle",
+    "bridge",
+    "warehouse",
+    "hangar",
+    "facility",
+    "stadium"
+  ],
+  "thresholds": {
+    "conservative": 1.45,
+    "balanced": 1.10,
+    "aggressive": 0.85
+  },
+  "large_axis_soft_m": 6.5,
+  "large_axis_hard_m": 10.0,
+  "vertex_soft": 160000,
+  "vertex_hard": 350000
+}

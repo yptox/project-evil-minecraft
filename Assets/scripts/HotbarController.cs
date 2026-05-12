@@ -1,16 +1,17 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 using UnityEngine;
-using UnityEngine.Events;
 
 namespace AlgorithmicGallery.Corruption
 {
-    // Manages 5 prop slots. Player selects with 1-5 keys, slots reroll after placement.
+    // Manages 3 prop slots. Player selects with 1-3 keys; after each placement a short "thinking"
+    // delay runs before the used slot rerolls and selection advances.
     // AssistantSystem can override slot contents during the Suggesting/Overriding phase.
     public class HotbarController : MonoBehaviour
     {
-        public const int SlotCount = 5;
+        public const int SlotCount = 3;
 
         [SerializeField] private float _assistantOverrideProbability = 0f; // driven by AssistantSystem
 
@@ -20,11 +21,16 @@ namespace AlgorithmicGallery.Corruption
 
         public event Action<int, PropEntry> OnSlotChanged;   // slot index, new prop
         public event Action<int> OnActiveSlotChanged;        // slot index
+        /// <summary>True while waiting after a player placement before the next hotbar reroll.</summary>
+        public event Action<bool> OnThinkingStateChanged;
+
+        public bool IsInPostPlacementThinking { get; private set; }
 
         private CuratedPropManifest _manifest;
         private StyleProfile _styleProfile;
         private PromptDefinition _activePrompt;
         private readonly Queue<string> _seedQueue = new();
+        private Coroutine _postPlacementThinkingRoutine;
 
         public void Initialize(CuratedPropManifest manifest, StyleProfile styleProfile)
         {
@@ -46,8 +52,9 @@ namespace AlgorithmicGallery.Corruption
         void Update()
         {
             if (_manifest == null) return;
+            if (IsInPostPlacementThinking) return;
 
-            // Number keys 1-5
+            // Number keys 1-3
             for (int i = 0; i < SlotCount; i++)
             {
                 if (Input.GetKeyDown(KeyCode.Alpha1 + i))
@@ -67,12 +74,38 @@ namespace AlgorithmicGallery.Corruption
             if (index < 0 || index >= SlotCount) return;
             ActiveSlot = index;
             OnActiveSlotChanged?.Invoke(index);
+            GameplayEventDebugLog.Push("Hotbar", $"active slot → {index + 1}");
         }
 
-        // Called by PropPlacer after a prop is placed. Rerolls the consumed slot.
-        public void ConsumeActiveSlot()
+        /// <summary>
+        /// After a successful player placement: blocks hotbar input for <paramref name="durationSeconds"/>,
+        /// then rerolls every slot and advances selection to the next slot.
+        /// </summary>
+        public void BeginPostPlacementThinking(float durationSeconds)
         {
-            Reroll(ActiveSlot);
+            if (_postPlacementThinkingRoutine != null)
+                StopCoroutine(_postPlacementThinkingRoutine);
+            _postPlacementThinkingRoutine = StartCoroutine(PostPlacementThinkingRoutine(durationSeconds));
+        }
+
+        private IEnumerator PostPlacementThinkingRoutine(float durationSeconds)
+        {
+            IsInPostPlacementThinking = true;
+            OnThinkingStateChanged?.Invoke(true);
+            GameplayEventDebugLog.Push("Hotbar", "thinking ON (post-placement)");
+
+            float wait = Mathf.Max(0.01f, durationSeconds);
+            yield return new WaitForSecondsRealtime(wait);
+
+            IsInPostPlacementThinking = false;
+            OnThinkingStateChanged?.Invoke(false);
+            GameplayEventDebugLog.Push("Hotbar", "thinking OFF → reroll slots");
+
+            for (int i = 0; i < SlotCount; i++)
+                Reroll(i);
+            SetActiveSlot((ActiveSlot + 1) % SlotCount);
+
+            _postPlacementThinkingRoutine = null;
         }
 
         // AssistantSystem calls this to pre-select a slot for the player during Suggesting phase.
@@ -116,6 +149,16 @@ namespace AlgorithmicGallery.Corruption
                     ? _manifest.GetFromDriftEmotionalGroups(
                         _activePrompt.DriftEmotionalTags, _activePrompt.DriftGroups)
                     : _manifest.GetFromDriftGroups(_activePrompt.DriftGroups);
+            }
+            else if (_activePrompt != null && !string.IsNullOrWhiteSpace(_activePrompt.CorporateTargetTag) && UnityEngine.Random.value < 0.52f)
+            {
+                float rand = _activePrompt.IsAbstract ? 0.08f : 0.16f;
+                pick = _manifest.GetWeightedByCorporateTagInGroups(
+                    _activePrompt.CorporateTargetTag,
+                    _activePrompt.PrimaryGroups,
+                    _activePrompt.EmotionalTags,
+                    randomness: rand,
+                    excludeIds: excludeIds);
             }
             else if (_activePrompt != null && _activePrompt.EmotionalTags?.Length > 0)
             {

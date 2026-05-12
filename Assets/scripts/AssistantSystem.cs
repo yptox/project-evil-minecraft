@@ -6,10 +6,9 @@ namespace AlgorithmicGallery.Corruption
 {
     // The "assistant" that watches the player build and progressively overrides their creative intent.
     //
-    // Three phases over 90 seconds:
-    //   Helping    (0-30s, influence 0.0-0.3) — mirrors player style, places 1 prop per player action
-    //   Suggesting (30-60s, influence 0.3-0.7) — drifts style, injects hotbar picks, places 2-3 per action
-    //   Overriding (60-90s, influence 0.7-1.0) — fills space aggressively regardless of player input
+    // Influence/phase still advance on session time for visuals (glitch, lighting), but the assistant
+    // only places props after a randomized player-placement threshold (default 8–12) and never
+    // exceeds a small cap of assistant-owned placements per sandbox.
     public class AssistantSystem : MonoBehaviour
     {
         public event Action OnActivated;
@@ -23,16 +22,16 @@ namespace AlgorithmicGallery.Corruption
         [SerializeField] private float _overridingThreshold = 0.7f;
 
         [Header("Placement rate (seconds between autonomous spawns)")]
-        [SerializeField] private float _helpingInterval = 6f;
-        [SerializeField] private float _suggestingInterval = 4f;
-        [SerializeField] private float _overridingInterval = 2f;
-        [SerializeField] private float _autonomousStartDelayAfterActivation = 0.8f;
-        [SerializeField] private float _reactivePlacementCooldown = 1.4f;
+        [SerializeField] private float _helpingInterval = 18f;
+        [SerializeField] private float _suggestingInterval = 22f;
+        [SerializeField] private float _overridingInterval = 20f;
+        [SerializeField] private float _autonomousStartDelayAfterActivation = 1.5f;
+        [SerializeField] private float _reactivePlacementCooldown = 6f;
 
         [Header("Props per autonomous action")]
         [SerializeField] private int _helpingBurstSize = 1;
         [SerializeField] private int _suggestingBurstSize = 1;
-        [SerializeField] private int _overridingBurstSize = 2;
+        [SerializeField] private int _overridingBurstSize = 1;
 
         [Header("Assistant Placement Positioning")]
         [Tooltip("Assistant tries to stay at least this far from existing placements.")]
@@ -44,11 +43,16 @@ namespace AlgorithmicGallery.Corruption
         [SerializeField] private int _positionSampleAttempts = 16;
 
         [Header("Activation gate")]
-        [Tooltip("Assistant stays dormant until the player has placed at least this many props.")]
-        [SerializeField] private int _minPlayerPlacementsBeforeActive = 5;
+        [Tooltip("Random inclusive range: assistant activates after this many player placements (rolled once per session).")]
+        [SerializeField] private int _activationMinPlayerPlacements = 8;
+        [SerializeField] private int _activationMaxPlayerPlacements = 12;
+
+        [Header("Assistant placement cap")]
+        [Tooltip("Maximum assistant placements (player + assistant total is capped separately by SandboxManager).")]
+        [SerializeField] private int _maxAssistantPlacements = 8;
 
         public bool IsActive => _styleProfile != null
-            && _styleProfile.PlayerPlacementCount >= _minPlayerPlacementsBeforeActive;
+            && _styleProfile.PlayerPlacementCount >= _activationPlayerThreshold;
 
         public float SessionTime { get; private set; }
         public float Influence { get; private set; }
@@ -66,6 +70,7 @@ namespace AlgorithmicGallery.Corruption
         private float _nextReactiveSpawnTime;
         private int _playerPlacementsSinceLastResponse;
         private bool _activationAnnounced;
+        private int _activationPlayerThreshold = 10;
 
         public void SetActivePrompt(PromptDefinition prompt)
         {
@@ -96,6 +101,11 @@ namespace AlgorithmicGallery.Corruption
             _nextReactiveSpawnTime = 0f;
             _playerPlacementsSinceLastResponse = 0;
             _activationAnnounced = false;
+
+            int min = Mathf.Min(_activationMinPlayerPlacements, _activationMaxPlayerPlacements);
+            int max = Mathf.Max(_activationMinPlayerPlacements, _activationMaxPlayerPlacements);
+            _activationPlayerThreshold = UnityEngine.Random.Range(min, max + 1);
+            Debug.Log($"[AssistantSystem] Will activate after {_activationPlayerThreshold} player placements (range {min}-{max}).");
         }
 
         public void StopSession() => IsRunning = false;
@@ -109,6 +119,7 @@ namespace AlgorithmicGallery.Corruption
             {
                 _activationAnnounced = true;
                 OnActivated?.Invoke();
+                GameplayEventDebugLog.Push("Assistant", "OnActivated");
                 // Ensure autonomous placement starts soon after activation,
                 // even if dormant scheduling had pushed the next spawn far out.
                 _nextAutonomousSpawnTime = Mathf.Min(
@@ -120,19 +131,14 @@ namespace AlgorithmicGallery.Corruption
             // Stay dormant until the player has placed enough props.
             if (!IsActive) return;
 
+            if (!AssistantCanPlaceMore()) return;
+
             if (SessionTime < _nextReactiveSpawnTime)
                 return;
             _nextReactiveSpawnTime = SessionTime + _reactivePlacementCooldown;
 
-            // Immediately mirror/respond to player placement (reactive placement)
-            int burst = Phase switch
-            {
-                AssistantPhase.Suggesting => _suggestingBurstSize,
-                AssistantPhase.Overriding => _overridingBurstSize,
-                _ => _helpingBurstSize,
-            };
-
-            StartCoroutine(ReactPlacement(position, burst));
+            // One reactive placement per player action (slow, capped).
+            StartCoroutine(ReactPlacement(position, 1));
         }
 
         void Update()
@@ -152,7 +158,7 @@ namespace AlgorithmicGallery.Corruption
                 UpdateHotbarInfluence();
 
                 // Autonomous timed placement (independent of player actions)
-                if (SessionTime >= _nextAutonomousSpawnTime)
+                if (SessionTime >= _nextAutonomousSpawnTime && AssistantCanPlaceMore())
                 {
                     float interval = CurrentInterval();
                     _nextAutonomousSpawnTime = SessionTime + interval;
@@ -165,9 +171,6 @@ namespace AlgorithmicGallery.Corruption
                 // fire instantly on activation.
                 _nextAutonomousSpawnTime = SessionTime + _helpingInterval;
             }
-
-            if (SessionTime >= _sessionDuration)
-                StopSession();
 
             // Drive PSX glitch intensity from assistant influence (always — it's a visual mood signal)
             PSXRendererFeature.SetBaseGlitchIntensity(Influence);
@@ -204,9 +207,12 @@ namespace AlgorithmicGallery.Corruption
 
         private IEnumerator ReactPlacement(Vector3 nearPosition, int count)
         {
+            if (!AssistantCanPlaceMore()) yield break;
+
             for (int i = 0; i < count; i++)
             {
-                yield return new WaitForSeconds(0.22f + i * 0.14f);
+                if (!AssistantCanPlaceMore()) yield break;
+                yield return new WaitForSeconds(0.48f + i * 0.32f);
                 PropEntry prop = PickPropForCurrentPhase();
                 Vector3 pos = ReactivePosition(nearPosition);
                 yield return PlacePropCoroutine(prop, pos);
@@ -215,16 +221,14 @@ namespace AlgorithmicGallery.Corruption
 
         private IEnumerator AutonomousPlacement()
         {
-            int count = Phase switch
-            {
-                AssistantPhase.Overriding => _overridingBurstSize,
-                AssistantPhase.Suggesting => _suggestingBurstSize,
-                _ => 1,
-            };
+            if (!AssistantCanPlaceMore()) yield break;
+
+            int count = 1;
 
             for (int i = 0; i < count; i++)
             {
-                yield return new WaitForSeconds(i * 0.2f);
+                if (!AssistantCanPlaceMore()) yield break;
+                yield return new WaitForSeconds(i * 0.55f);
                 PropEntry prop = PickPropForCurrentPhase();
                 Vector3 pos = AutonomousPosition();
                 yield return PlacePropCoroutine(prop, pos);
@@ -233,6 +237,7 @@ namespace AlgorithmicGallery.Corruption
 
         private IEnumerator PlacePropCoroutine(PropEntry prop, Vector3 pos)
         {
+            if (!AssistantCanPlaceMore()) yield break;
             if (prop == null) yield break;
             float yRot = UnityEngine.Random.Range(0f, 360f);
             var task = _placer.PlaceAt(prop, pos, yRot, isPlayerPlacement: false);
@@ -263,42 +268,35 @@ namespace AlgorithmicGallery.Corruption
 
         private PropEntry PickPropForPhaseWithPrompt()
         {
-            bool hasEmotional      = _activePrompt.EmotionalTags?.Length > 0;
-            bool hasDriftEmotional = _activePrompt.DriftEmotionalTags?.Length > 0;
-            var  playerTags        = _styleProfile.PlacementCount > 0 ? _styleProfile.DominantTags() : null;
+            if (_manifest == null)
+                return null;
 
-            return Phase switch
-            {
-                // Helping: stay within the player's theme. For abstract prompts, emotional
-                // tags are the primary driver — we want props that carry the right feeling.
-                AssistantPhase.Helping => hasEmotional
-                    ? _manifest.GetWeightedByEmotionalTagsInGroups(
-                        _activePrompt.EmotionalTags, _activePrompt.PrimaryGroups, randomness: 0.1f)
-                    : playerTags != null
-                        ? _manifest.GetWeightedByTagsInGroups(
-                            playerTags, _activePrompt.PrimaryGroups, randomness: 0.1f)
-                        : _manifest.GetRandomFromGroups(_activePrompt.PrimaryGroups),
+            PromptScoringHelper.EnsureCorporateTarget(_activePrompt);
+            string corp = _activePrompt.CorporateTargetTag?.Trim().ToLowerInvariant();
+            if (string.IsNullOrEmpty(corp))
+                corp = "marketable";
 
-                // Suggesting: the drift begins — 40% still on-theme, 60% starting to push away.
-                // For abstract prompts this means: the system starts misreading your emotional intent.
-                AssistantPhase.Suggesting => UnityEngine.Random.value < 0.4f
-                    ? (hasEmotional
-                        ? _manifest.GetWeightedByEmotionalTagsInGroups(
-                            _activePrompt.EmotionalTags, _activePrompt.PrimaryGroups, randomness: 0.3f)
-                        : _manifest.GetRandomFromGroups(_activePrompt.PrimaryGroups))
-                    : (hasDriftEmotional
-                        ? _manifest.GetFromDriftEmotionalGroups(
-                            _activePrompt.DriftEmotionalTags, _activePrompt.DriftGroups)
-                        : _manifest.GetFromDriftGroups(_activePrompt.DriftGroups)),
+            // Corporate-only selection: no phase drift, no player StyleProfile weighting.
+            // Pool is prompt primary groups when set; otherwise entire manifest.
+            string[] groups = _activePrompt.PrimaryGroups;
+            if (groups == null || groups.Length == 0)
+                groups = null;
 
-                // Overriding: the system's own vision, completely. Emotionally alien.
-                AssistantPhase.Overriding => hasDriftEmotional
-                    ? _manifest.GetFromDriftEmotionalGroups(
-                        _activePrompt.DriftEmotionalTags, _activePrompt.DriftGroups)
-                    : _manifest.GetFromDriftGroups(_activePrompt.DriftGroups),
+            const float randomness = 0.06f;
+            var pick = _manifest.GetWeightedByCorporateTagInGroups(
+                corp, groups, secondaryEmotionalTags: null, randomness: randomness);
+            if (pick != null)
+                return pick;
 
-                _ => _manifest.GetRandom(),
-            };
+            pick = _manifest.GetWeightedByCorporateTagInGroups(
+                corp, groups: null, secondaryEmotionalTags: null, randomness: randomness);
+            if (pick != null)
+                return pick;
+
+            if (_activePrompt.PrimaryGroups != null && _activePrompt.PrimaryGroups.Length > 0)
+                return _manifest.GetRandomFromGroups(_activePrompt.PrimaryGroups);
+
+            return _manifest.GetRandom();
         }
 
         private Vector3 ReactivePosition(Vector3 nearPlayerPlacement)
@@ -387,10 +385,19 @@ namespace AlgorithmicGallery.Corruption
                 _ => _helpingInterval,
             };
 
-            // Keep early session slower, then gently ramp up by the end of the 90s arc.
+            // Keep early session slower, then gently ramp up by the end of the influence arc.
             float sessionProgress = Mathf.Clamp01(SessionTime / Mathf.Max(1f, _sessionDuration));
             float speedFactor = Mathf.Lerp(1.15f, 0.9f, sessionProgress);
             return baseInterval * speedFactor;
+        }
+
+        private bool AssistantCanPlaceMore()
+        {
+            if (_styleProfile == null || _placer == null)
+                return false;
+            if (!_placer.PlacementEnabled)
+                return false;
+            return _styleProfile.AssistantPlacementCount < _maxAssistantPlacements;
         }
     }
 
